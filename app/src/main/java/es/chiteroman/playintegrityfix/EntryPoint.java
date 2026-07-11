@@ -67,6 +67,9 @@ public final class EntryPoint {
     }
 
     public static void init(int logLevel, int spoofBuildVal, int spoofProviderVal, int spoofSignatureVal) {
+		if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            HiddenApiBypass.addHiddenApiExemptions("");
+        }
         verboseLogs = logLevel;
         spoofBuildEnabled = spoofBuildVal;
         if (verboseLogs > 99) logFields();
@@ -185,6 +188,16 @@ public final class EntryPoint {
         }
         return false;
     }
+	
+	private static void stripFinal(Field field, String name) {
+        try {
+            Field accessFlagsField = Field.class.getDeclaredField("accessFlags");
+            accessFlagsField.setAccessible(true);
+            accessFlagsField.setInt(field, field.getModifiers() & ~java.lang.reflect.Modifier.FINAL);
+        } catch (NoSuchFieldException | IllegalAccessException e) {
+            LOG(String.format("Couldn't modify accessFlags for '%s': " + e, name));
+        }
+    }
 
     private static void setField(String name, String value) {
         if (value.isEmpty()) {
@@ -200,25 +213,24 @@ public final class EntryPoint {
                 }
 
                 field.setAccessible(true);
+				stripFinal(field, name);
                 Class<?> fieldType = field.getType();
 
                 if (fieldType == String.class) {
-                    field.set(null, "");
+                    setFieldNative(field.getDeclaringClass(), field, fieldType.getName(), "");
                     LOG(String.format("[%s]: Cleared (set to empty string)", name));
                 } else if (fieldType == int.class) {
-                    field.set(null, 0);
+                    setFieldNative(field.getDeclaringClass(), field, fieldType.getName(), Integer.valueOf(0));
                     LOG(String.format("[%s]: Cleared (set to 0)", name));
                 } else if (fieldType == long.class) {
-                    field.set(null, 0L);
+                    setFieldNative(field.getDeclaringClass(), field, fieldType.getName(), Long.valueOf(0L));
                     LOG(String.format("[%s]: Cleared (set to 0L)", name));
                 } else if (fieldType == boolean.class) {
-                    field.set(null, false);
+                    setFieldNative(field.getDeclaringClass(), field, fieldType.getName(), Boolean.valueOf(false));
                     LOG(String.format("[%s]: Cleared (set to false)", name));
                 } else {
                     LOG(String.format("[%s]: Unknown type %s, not cleared", name, fieldType));
                 }
-
-                field.setAccessible(false);
             } catch (Exception e) {
                 LOG(String.format("Error resetting field '%s': %s", name, e));
             }
@@ -243,8 +255,13 @@ public final class EntryPoint {
             return;
         }
         field.setAccessible(true);
-        try {
-            oldValue = String.valueOf(field.get(null));
+		stripFinal(field, name);
+		Class<?> fieldType = field.getType();
+		try {
+            Object rawOld = field.get(null);
+            oldValue = (fieldType == String[].class)
+                ? String.join(", ", (String[]) rawOld)
+                : String.valueOf(rawOld);
         } catch (IllegalAccessException e) {
             LOG(String.format("Couldn't access '%s' field value: " + e, name));
             return;
@@ -253,28 +270,40 @@ public final class EntryPoint {
             if (verboseLogs > 2) LOG(String.format("[%s]: %s (unchanged)", name, value));
             return;
         }
-        Class<?> fieldType = field.getType();
         if (fieldType == String.class) {
             newValue = value;
         } else if (fieldType == int.class) {
-            newValue = Integer.parseInt(value);
+            try {
+                newValue = Integer.parseInt(value);
+            } catch (NumberFormatException e) {
+                LOG(String.format("Invalid int value '%s' for field '%s'", value, name));
+                return;
+            }
         } else if (fieldType == long.class) {
-            newValue = Long.parseLong(value);
+            try {
+                newValue = Long.parseLong(value);
+            } catch (NumberFormatException e) {
+                LOG(String.format("Invalid long value '%s' for field '%s'", value, name));
+                return;
+            }
         } else if (fieldType == boolean.class) {
             newValue = Boolean.parseBoolean(value);
+		} else if (fieldType == String[].class) {
+            newValue = value.split(",");
         } else {
             LOG(String.format("Couldn't convert '%s' to '%s' type", value, fieldType));
             return;
         }
         try {
-            field.set(null, newValue);
-        } catch (IllegalAccessException e) {
-            LOG(String.format("Couldn't modify '%s' field value: " + e, name));
-            return;
+            setFieldNative(field.getDeclaringClass(), field, fieldType.getName(), newValue);
+        } catch (Exception e) {
+            LOG(String.format("Native setField failed for '%s': " + e, name));
         }
-        field.setAccessible(false);
-        LOG(String.format("[%s]: %s -> %s", name, oldValue, value));
+        LOG(String.format("[%s]: %s -> %s", name, oldValue,
+            fieldType == String[].class ? String.join(", ", (String[]) newValue) : value));
     }
+	
+	private static native void setFieldNative(Class<?> targetClass, Field field, String type, Object value);
 
     private static String logParseField(Field field) {
         Object value = null;
