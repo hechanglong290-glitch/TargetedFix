@@ -31,13 +31,9 @@ public final class EntryPoint {
     private static Integer verboseLogs = 0;
     private static Integer spoofBuildEnabled = 1;
 
-    // 伪装目标容量：512 GB 总空间，256 GB 剩余空间 (单位：字节)
-    private static final long FAKE_TOTAL_BYTES = 512ULL_BYTES(512);
-    private static final long FAKE_FREE_BYTES = 512ULL_BYTES(256);
-
-    private static long 512ULL_BYTES(long gb) {
-        return gb * 1024L * 1024L * 1024L;
-    }
+    // 修复：合法 Java 语法计算字节大小 (512 GB 与 256 GB)
+    private static final long FAKE_TOTAL_BYTES = 512L * 1024L * 1024L * 1024L;
+    private static final long FAKE_FREE_BYTES  = 256L * 1024L * 1024L * 1024L;
 
     private static final String signatureData = "MIIFyTCCA7GgAwIBAgIVALyxxl+zDS9SL68SzOr48309eAZyMA0GCSqGSIb3DQEBCwUAMHQxCzAJ\n" +
             "BgNVBAYTAlVTMRMwEQYDVQQIEwpDYWxpZm9ybmlhMRYwFAYDVQQHEw1Nb3VudGFpbiBWaWV3MRQw\n" +
@@ -83,7 +79,7 @@ public final class EntryPoint {
         if (spoofBuildVal > 0) spoofDevice();
         if (spoofSignatureVal > 0) spoofPackageManager();
 
-        // 核心修改：Hook StorageStats 服务以伪装设置界面的柱状图
+        // Hook StorageStats 服务伪装柱状图
         spoofStorageStatsService();
     }
 
