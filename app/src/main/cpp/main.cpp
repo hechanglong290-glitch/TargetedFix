@@ -13,10 +13,21 @@
 #include <sys/sysinfo.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 
 #include "zygisk.hpp"
 #include "json/single_include/nlohmann/json.hpp"
 #include "dobby.h"
+
+// 兼容性兜底：解决部分 NDK 版本未声明 memfd_create 的问题
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC 0x0001U
+#endif
+
+static inline int compat_memfd_create(const char *name, unsigned int flags) {
+    return static_cast<int>(syscall(__NR_memfd_create, name, flags));
+}
+#define memfd_create compat_memfd_create
 
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, "TFIX/Native", __VA_ARGS__)
 #define DEX_FILE_PATH "/data/adb/modules/targetedfix/classes.dex"
@@ -111,7 +122,6 @@ static int my_sysinfo(struct sysinfo *info) {
     if (res == 0 && info != nullptr) {
         uint64_t unit = info->mem_unit ? info->mem_unit : 1;
         
-        // 按照已用内存 x2 换算
         unsigned long long real_total = info->totalram * unit;
         unsigned long long real_free = info->freeram * unit;
         unsigned long long real_used = (real_total > real_free) ? (real_total - real_free) : real_free;
@@ -128,7 +138,7 @@ static int my_sysinfo(struct sysinfo *info) {
     return res;
 }
 
-// 2. /proc/meminfo 文件 Hook (基于 memfd_create 完美换算)
+// 2. /proc/meminfo 文件 Hook
 static std::string generate_fake_meminfo() {
     FILE *fp = fopen("/proc/meminfo", "r");
     if (!fp) return "";
@@ -136,7 +146,6 @@ static std::string generate_fake_meminfo() {
     char line[256];
     std::map<std::string, unsigned long long> memMap;
 
-    // 解析真实 meminfo
     while (fgets(line, sizeof(line), fp)) {
         char key[64] = {0};
         unsigned long long val = 0;
@@ -150,23 +159,20 @@ static std::string generate_fake_meminfo() {
     }
     fclose(fp);
 
-    // 获取真实基准数据
     unsigned long long r_total = memMap.count("MemTotal") ? memMap["MemTotal"] : 2055168ULL;
     unsigned long long r_free = memMap.count("MemFree") ? memMap["MemFree"] : 494076ULL;
     unsigned long long r_avail = memMap.count("MemAvailable") ? memMap["MemAvailable"] : 1087320ULL;
     unsigned long long r_buffers = memMap.count("Buffers") ? memMap["Buffers"] : 7676ULL;
     unsigned long long r_cached = memMap.count("Cached") ? memMap["Cached"] : 718756ULL;
 
-    // 规则实现：已用内存 = 总内存 - 可用内存，然后放大 2 倍
     unsigned long long r_used = (r_total > r_avail) ? (r_total - r_avail) : (r_total - r_free);
     unsigned long long f_used = r_used * 2ULL;
-    unsigned long long f_total = FAKE_RAM_TOTAL_KB; // 4GB
+    unsigned long long f_total = FAKE_RAM_TOTAL_KB;
 
     if (f_used >= f_total) {
-        f_used = f_total - 512ULL * 1024ULL; // 至少留出 512MB
+        f_used = f_total - 512ULL * 1024ULL;
     }
 
-    // 可用内存自动换算
     unsigned long long f_avail = f_total - f_used;
     double scale = (r_avail > 0) ? ((double)f_avail / (double)r_avail) : 1.0;
     
@@ -174,7 +180,6 @@ static std::string generate_fake_meminfo() {
     unsigned long long f_buffers = (unsigned long long)(r_buffers * scale);
     unsigned long long f_cached = (unsigned long long)(r_cached * scale);
 
-    // 重新组合输出
     fp = fopen("/proc/meminfo", "r");
     if (!fp) return "";
 
@@ -215,7 +220,6 @@ static std::string generate_fake_meminfo() {
     return newContent;
 }
 
-// 核心改进：用 memfd_create 创建内存文件描述符，完美支持 lseek 和 read
 static int create_fake_meminfo_fd() {
     std::string fakeData = generate_fake_meminfo();
     if (fakeData.empty()) return -1;
@@ -224,7 +228,7 @@ static int create_fake_meminfo_fd() {
     if (memfd < 0) return -1;
 
     write(memfd, fakeData.c_str(), fakeData.size());
-    lseek(memfd, 0, SEEK_SET); // 指针复位到开头，供 App 读取
+    lseek(memfd, 0, SEEK_SET);
     return memfd;
 }
 
