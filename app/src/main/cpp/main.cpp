@@ -17,14 +17,12 @@
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, "TFIX/Native", __VA_ARGS__)
 #define DEX_FILE_PATH "/data/adb/modules/targetedfix/classes.dex"
 
-// 硬编码伪装容量参数：512GB 总空间，256GB 剩余空间
-static constexpr uint64_t FAKE_TOTAL_GB = 512; 
-static constexpr uint64_t FAKE_FREE_GB  = 256;
+// 硬编码伪装容量参数：32GB 总空间
+static constexpr uint64_t FAKE_TOTAL_GB = 32; 
 
 static bool spoofStorage = (FAKE_TOTAL_GB > 0);
 static const uint64_t FAKE_BLOCK_SIZE = 4096;
 static fsblkcnt_t fakeTotalBlocks = (FAKE_TOTAL_GB * 1024ULL * 1024ULL * 1024ULL) / FAKE_BLOCK_SIZE;
-static fsblkcnt_t fakeFreeBlocks  = (FAKE_FREE_GB * 1024ULL * 1024ULL * 1024ULL) / FAKE_BLOCK_SIZE;
 
 typedef void (*T_Callback)(void *, const char *, const char *, uint32_t);
 static std::map<void *, T_Callback> callbacks;
@@ -60,11 +58,20 @@ static inline bool is_user_storage_path(const char *path) {
 static int my_statvfs(const char *path, struct statvfs *buf) {
     int result = orig_statvfs(path, buf);
     if (result == 0 && buf != nullptr && spoofStorage && is_user_storage_path(path)) {
+        // 计算真实剩余块数的 6 倍
+        uint64_t realFreeBlocks = buf->f_bfree;
+        uint64_t fakeFreeBlocks = realFreeBlocks * 6ULL;
+        
+        // 防超限处理：剩余块数不能超过总块数
+        if (fakeFreeBlocks > fakeTotalBlocks) {
+            fakeFreeBlocks = fakeTotalBlocks;
+        }
+
         buf->f_bsize   = FAKE_BLOCK_SIZE;
         buf->f_frsize  = FAKE_BLOCK_SIZE;
         buf->f_blocks  = fakeTotalBlocks;
-        buf->f_bfree   = fakeFreeBlocks;
-        buf->f_bavail  = fakeFreeBlocks;
+        buf->f_bfree   = static_cast<fsblkcnt_t>(fakeFreeBlocks);
+        buf->f_bavail  = static_cast<fsblkcnt_t>(fakeFreeBlocks);
     }
     return result;
 }
@@ -72,10 +79,19 @@ static int my_statvfs(const char *path, struct statvfs *buf) {
 static int my_statfs(const char *path, struct statfs *buf) {
     int result = orig_statfs(path, buf);
     if (result == 0 && buf != nullptr && spoofStorage && is_user_storage_path(path)) {
+        // 计算真实剩余块数的 6 倍
+        uint64_t realFreeBlocks = buf->f_bfree;
+        uint64_t fakeFreeBlocks = realFreeBlocks * 6ULL;
+
+        // 防超限处理：剩余块数不能超过总块数
+        if (fakeFreeBlocks > fakeTotalBlocks) {
+            fakeFreeBlocks = fakeTotalBlocks;
+        }
+
         buf->f_bsize  = FAKE_BLOCK_SIZE;
         buf->f_blocks = fakeTotalBlocks;
-        buf->f_bfree  = fakeFreeBlocks;
-        buf->f_bavail = fakeFreeBlocks;
+        buf->f_bfree  = static_cast<fsblkcnt_t>(fakeFreeBlocks);
+        buf->f_bavail = static_cast<fsblkcnt_t>(fakeFreeBlocks);
     }
     return result;
 }
