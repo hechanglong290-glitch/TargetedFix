@@ -6,60 +6,30 @@
 #include <algorithm>
 #include <cctype>
 #include <map>
-#include <mutex>
 #include <cstdio>
-#include <cstring>
-#include <ctime>
 #include <sys/statvfs.h>
 #include <sys/vfs.h>
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/syscall.h>
 
 #include "zygisk.hpp"
 #include "json/single_include/nlohmann/json.hpp"
 #include "dobby.h"
 
-// 兼容性兜底：解决部分 NDK 版本未声明 memfd_create 的问题
-#ifndef MFD_CLOEXEC
-#define MFD_CLOEXEC 0x0001U
-#endif
-
-static inline int compat_memfd_create(const char *name, unsigned int flags) {
-    return static_cast<int>(syscall(__NR_memfd_create, name, flags));
-}
-#define memfd_create compat_memfd_create
-
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, "TFIX/Native", __VA_ARGS__)
 #define DEX_FILE_PATH "/data/adb/modules/targetedfix/classes.dex"
 
-// 硬编码伪装参数：32GB 总存储空间
+// 硬编码伪装容量参数：32GB 总空间
 static constexpr uint64_t FAKE_TOTAL_GB = 32; 
 
 static bool spoofStorage = (FAKE_TOTAL_GB > 0);
 static const uint64_t FAKE_BLOCK_SIZE = 4096;
 static fsblkcnt_t fakeTotalBlocks = (FAKE_TOTAL_GB * 1024ULL * 1024ULL * 1024ULL) / FAKE_BLOCK_SIZE;
 
-// ==================== 内存 (RAM) 伪装参数配置 ====================
-static constexpr uint64_t FAKE_RAM_TOTAL_GB = 4ULL; // 总 RAM 固定为 4GB
-static constexpr uint64_t FAKE_RAM_TOTAL_KB = FAKE_RAM_TOTAL_GB * 1024ULL * 1024ULL; // 4194304 kB
-
 typedef void (*T_Callback)(void *, const char *, const char *, uint32_t);
 static std::map<void *, T_Callback> callbacks;
-static std::mutex callbacks_mutex;
 
 static void modify_callback(void *cookie, const char *name, const char *value, uint32_t serial) {
-    if (cookie == nullptr || name == nullptr || value == nullptr) return;
-    T_Callback cb = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(callbacks_mutex);
-        if (callbacks.contains(cookie)) {
-            cb = callbacks[cookie];
-        }
-    }
-    if (cb) {
-        cb(cookie, name, value, serial);
-    }
+    if (cookie == nullptr || name == nullptr || value == nullptr || !callbacks.contains(cookie)) return;
+    return callbacks[cookie](cookie, name, value, serial);
 }
 
 static void (*o_system_property_read_callback)(const prop_info *, T_Callback, void *);
@@ -68,14 +38,11 @@ static void my_system_property_read_callback(const prop_info *pi, T_Callback cal
     if (pi == nullptr || callback == nullptr || cookie == nullptr) {
         return o_system_property_read_callback(pi, callback, cookie);
     }
-    {
-        std::lock_guard<std::mutex> lock(callbacks_mutex);
-        callbacks[cookie] = callback;
-    }
+    callbacks[cookie] = callback;
     return o_system_property_read_callback(pi, modify_callback, cookie);
 }
 
-// ==================== statvfs / statfs 存储 Hook 逻辑 ====================
+// ==================== statvfs / statfs / 64位 全路线 Hook 逻辑 ====================
 static int (*orig_statvfs)(const char *path, struct statvfs *buf) = nullptr;
 static int (*orig_statfs)(const char *path, struct statfs *buf) = nullptr;
 
@@ -91,9 +58,11 @@ static inline bool is_user_storage_path(const char *path) {
 static int my_statvfs(const char *path, struct statvfs *buf) {
     int result = orig_statvfs(path, buf);
     if (result == 0 && buf != nullptr && spoofStorage && is_user_storage_path(path)) {
+        // 计算真实剩余块数的 6 倍
         uint64_t realFreeBlocks = buf->f_bfree;
         uint64_t fakeFreeBlocks = realFreeBlocks * 6ULL;
         
+        // 防超限处理：剩余块数不能超过总块数
         if (fakeFreeBlocks > fakeTotalBlocks) {
             fakeFreeBlocks = fakeTotalBlocks;
         }
@@ -110,9 +79,11 @@ static int my_statvfs(const char *path, struct statvfs *buf) {
 static int my_statfs(const char *path, struct statfs *buf) {
     int result = orig_statfs(path, buf);
     if (result == 0 && buf != nullptr && spoofStorage && is_user_storage_path(path)) {
+        // 计算真实剩余块数的 6 倍
         uint64_t realFreeBlocks = buf->f_bfree;
         uint64_t fakeFreeBlocks = realFreeBlocks * 6ULL;
 
+        // 防超限处理：剩余块数不能超过总块数
         if (fakeFreeBlocks > fakeTotalBlocks) {
             fakeFreeBlocks = fakeTotalBlocks;
         }
@@ -123,141 +94,6 @@ static int my_statfs(const char *path, struct statfs *buf) {
         buf->f_bavail = static_cast<fsblkcnt_t>(fakeFreeBlocks);
     }
     return result;
-}
-
-// ==================== 3秒缓存优化的 /proc/meminfo 内存 Hook 核心逻辑 ====================
-static std::string g_cached_meminfo;
-static time_t g_last_update_time = 0;
-static std::mutex g_meminfo_mutex;
-static thread_local bool g_is_hooking = false; // 防递归锁
-
-static std::string generate_fake_meminfo() {
-    std::lock_guard<std::mutex> lock(g_meminfo_mutex);
-    time_t now = time(nullptr);
-    
-    if (!g_cached_meminfo.empty() && (now - g_last_update_time < 3)) {
-        return g_cached_meminfo;
-    }
-
-    g_is_hooking = true;
-    FILE *fp = fopen("/proc/meminfo", "r");
-    g_is_hooking = false;
-
-    if (!fp) return g_cached_meminfo;
-
-    char line[256];
-    std::map<std::string, unsigned long long> memMap;
-    std::vector<std::string> lines;
-    lines.reserve(64);
-
-    while (fgets(line, sizeof(line), fp)) {
-        lines.emplace_back(line);
-        char key[64] = {0};
-        unsigned long long val = 0;
-        if (sscanf(line, "%63s %20llu", key, &val) == 2) {
-            size_t len = strlen(key);
-            if (len > 0 && key[len - 1] == ':') {
-                key[len - 1] = '\0';
-            }
-            memMap[key] = val;
-        }
-    }
-    fclose(fp);
-
-    unsigned long long r_total = memMap.count("MemTotal") ? memMap["MemTotal"] : 2055168ULL;
-    unsigned long long r_free = memMap.count("MemFree") ? memMap["MemFree"] : 494076ULL;
-    unsigned long long r_avail = memMap.count("MemAvailable") ? memMap["MemAvailable"] : 1087320ULL;
-    unsigned long long r_buffers = memMap.count("Buffers") ? memMap["Buffers"] : 7676ULL;
-    unsigned long long r_cached = memMap.count("Cached") ? memMap["Cached"] : 718756ULL;
-
-    unsigned long long r_used = (r_total > r_avail) ? (r_total - r_avail) : (r_total - r_free);
-    unsigned long long f_used = r_used * 2ULL;
-    unsigned long long f_total = FAKE_RAM_TOTAL_KB;
-
-    if (f_used >= f_total) {
-        f_used = f_total - 512ULL * 1024ULL;
-    }
-
-    unsigned long long f_avail = f_total - f_used;
-    double scale = (r_avail > 0) ? ((double)f_avail / (double)r_avail) : 1.0;
-    
-    unsigned long long f_free = (unsigned long long)(r_free * scale);
-    unsigned long long f_buffers = (unsigned long long)(r_buffers * scale);
-    unsigned long long f_cached = (unsigned long long)(r_cached * scale);
-
-    std::string newContent;
-    newContent.reserve(4096);
-
-    for (const auto &l : lines) {
-        if (l.starts_with("MemTotal:")) {
-            char buf[128];
-            snprintf(buf, sizeof(buf), "MemTotal:       %8llu kB\n", f_total);
-            newContent += buf;
-        } 
-        else if (l.starts_with("MemFree:")) {
-            char buf[128];
-            snprintf(buf, sizeof(buf), "MemFree:        %8llu kB\n", f_free);
-            newContent += buf;
-        } 
-        else if (l.starts_with("MemAvailable:")) {
-            char buf[128];
-            snprintf(buf, sizeof(buf), "MemAvailable:   %8llu kB\n", f_avail);
-            newContent += buf;
-        } 
-        else if (l.starts_with("Buffers:")) {
-            char buf[128];
-            snprintf(buf, sizeof(buf), "Buffers:        %8llu kB\n", f_buffers);
-            newContent += buf;
-        } 
-        else if (l.starts_with("Cached:")) {
-            char buf[128];
-            snprintf(buf, sizeof(buf), "Cached:         %8llu kB\n", f_cached);
-            newContent += buf;
-        } 
-        else {
-            newContent += l;
-        }
-    }
-
-    g_cached_meminfo = newContent;
-    g_last_update_time = now;
-    return g_cached_meminfo;
-}
-
-static int create_fake_meminfo_fd() {
-    std::string fakeData = generate_fake_meminfo();
-    if (fakeData.empty()) return -1;
-
-    int memfd = memfd_create("meminfo", MFD_CLOEXEC);
-    if (memfd < 0) return -1;
-
-    write(memfd, fakeData.c_str(), fakeData.size());
-    lseek(memfd, 0, SEEK_SET);
-    return memfd;
-}
-
-static int (*orig_openat)(int dirfd, const char *pathname, int flags, mode_t mode) = nullptr;
-static int my_openat(int dirfd, const char *pathname, int flags, mode_t mode) {
-    if (pathname != nullptr && strstr(pathname, "meminfo") != nullptr) {
-        LOGD("[*] 捕获到目标路径包含 meminfo: %s (g_is_hooking: %d)", pathname, g_is_hooking);
-    }
-
-    if (!g_is_hooking && pathname != nullptr && strcmp(pathname, "/proc/meminfo") == 0) {
-        LOGD("[+] 成功拦截并伪装 /proc/meminfo 数据！");
-        int fake_fd = create_fake_meminfo_fd();
-        if (fake_fd >= 0) return fake_fd;
-    }
-    return orig_openat(dirfd, pathname, flags, mode);
-}
-
-static int (*orig_open)(const char *pathname, int flags, mode_t mode) = nullptr;
-static int my_open(const char *pathname, int flags, mode_t mode) {
-    if (!g_is_hooking && pathname != nullptr && strcmp(pathname, "/proc/meminfo") == 0) {
-        LOGD("[+] 成功拦截并伪装 /proc/meminfo 数据 (open)！");
-        int fake_fd = create_fake_meminfo_fd();
-        if (fake_fd >= 0) return fake_fd;
-    }
-    return orig_open(pathname, flags, mode);
 }
 
 static void doHook() {
@@ -281,18 +117,6 @@ static void doHook() {
             DobbyHook(statfs_ptr, reinterpret_cast<dobby_dummy_func_t>(my_statfs),
                       reinterpret_cast<dobby_dummy_func_t*>(&orig_statfs));
         }
-    }
-
-    void* openat_ptr = DobbySymbolResolver(nullptr, "openat");
-    if (openat_ptr) {
-        DobbyHook(openat_ptr, reinterpret_cast<dobby_dummy_func_t>(my_openat),
-                  reinterpret_cast<dobby_dummy_func_t*>(&orig_openat));
-    }
-
-    void* open_ptr = DobbySymbolResolver(nullptr, "open");
-    if (open_ptr) {
-        DobbyHook(open_ptr, reinterpret_cast<dobby_dummy_func_t>(my_open),
-                  reinterpret_cast<dobby_dummy_func_t*>(&orig_open));
     }
 }
 
@@ -333,13 +157,11 @@ public:
     }
 
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
+        // 关键防护：如果 app_data_dir 为空，说明不是标准的 APK/应用进程，直接跳过注入！
         if (args == nullptr || args->app_data_dir == nullptr || args->nice_name == nullptr) {
             api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
             return;
         }
-
-        // 双保险：在子进程专有化前挂载 Hook
-        doHook();
 
         auto rawProcess = env->GetStringUTFChars(args->nice_name, nullptr);
         auto rawDir = env->GetStringUTFChars(args->app_data_dir, nullptr);
@@ -379,15 +201,16 @@ public:
     }
 
     void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
-        doHook(); // 再次确保主线程生效
         if (dexVector.empty()) return;
 
-        inject();
+        doHook();
+        inject(); // 只有纯正的 APK 进程才会加载并执行 DEX 注入
 
         dexVector.clear();
     }
 
     void preServerSpecialize(zygisk::ServerSpecializeArgs *args) override {
+        // system_server 只做底层 C 函数 Hook，绝不调用 inject() 注入 DEX
         doHook();
     }
 
