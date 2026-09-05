@@ -46,10 +46,8 @@ static void modify_callback(void *cookie, const char *name, const char *value, u
     std::string prop(name);
 
     if (jsonProps.count(prop)) {
-        // Exact property match
         value = jsonProps[prop].c_str();
     } else {
-        // Leading * wildcard property match
         for (const auto &p: jsonProps) {
             if (p.first.starts_with("*") && prop.ends_with(p.first.substr(1))) {
                 value = p.second.c_str();
@@ -83,9 +81,12 @@ static int (*orig_statfs)(const char *path, struct statfs *buf) = nullptr;
 
 static inline bool is_user_storage_path(const char *path) {
     if (!path) return false;
+    // 允许捕获所有常见的分区及挂载路径，防止 AIDA64 查询根目录或挂载点时漏掉
     return (strncmp(path, "/data", 5) == 0 || 
             strncmp(path, "/storage", 8) == 0 || 
-            strncmp(path, "/sdcard", 7) == 0);
+            strncmp(path, "/sdcard", 7) == 0 ||
+            strncmp(path, "/mnt", 4) == 0 ||
+            strcmp(path, "/") == 0);
 }
 
 static int my_statvfs(const char *path, struct statvfs *buf) {
@@ -114,7 +115,6 @@ static int my_statfs(const char *path, struct statfs *buf) {
 }
 
 static void doHook() {
-    // 1. Hook __system_property_read_callback
     void *handle = DobbySymbolResolver(nullptr, "__system_property_read_callback");
     if (handle == nullptr) {
         LOGD("Couldn't find '__system_property_read_callback' handle");
@@ -124,7 +124,6 @@ static void doHook() {
                   reinterpret_cast<dobby_dummy_func_t *>(&o_system_property_read_callback));
     }
 
-    // 2. Hook statvfs 与 statfs 用于硬盘空间伪装
     if (spoofStorage) {
         void* statvfs_ptr = DobbySymbolResolver(nullptr, "statvfs");
         if (statvfs_ptr) {
@@ -402,7 +401,7 @@ private:
             if (!json["FAKE_TOTAL_GB"].is_null() && json["FAKE_TOTAL_GB"].is_string() && json["FAKE_TOTAL_GB"] != "") {
                 totalGb = std::stoull(json["FAKE_TOTAL_GB"].get<std::string>());
             }
-            json.erase("FAKE_TOTAL_GB");
+            json.erase("FAKE_TOTAL_GB"); // 移除后不影响整体逻辑
         }
         if (json.contains("FAKE_FREE_GB")) {
             if (!json["FAKE_FREE_GB"].is_null() && json["FAKE_FREE_GB"].is_string() && json["FAKE_FREE_GB"] != "") {
@@ -417,7 +416,7 @@ private:
             fakeTotalBlocks = totalBytes / FAKE_BLOCK_SIZE;
             fakeFreeBlocks  = freeBytes / FAKE_BLOCK_SIZE;
             spoofStorage = true;
-            LOGD("Storage Spoofing enabled: Total %LLU GB, Free %LLU GB", totalGb, freeGb);
+            LOGD("Storage Spoofing enabled: Total %llu GB, Free %llu GB", (unsigned long long)totalGb, (unsigned long long)freeGb);
         }
 
         std::vector<std::string> eraseKeys;
