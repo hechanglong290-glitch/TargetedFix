@@ -9,6 +9,7 @@
 #include <mutex>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <sys/statvfs.h>
 #include <sys/vfs.h>
 #include <fcntl.h>
@@ -124,10 +125,27 @@ static int my_statfs(const char *path, struct statfs *buf) {
     return result;
 }
 
-// ==================== /proc/meminfo 内存 Hook 核心逻辑 ====================
+// ==================== 3秒缓存优化的 /proc/meminfo 内存 Hook 核心逻辑 ====================
+static std::string g_cached_meminfo;
+static time_t g_last_update_time = 0;
+static std::mutex g_meminfo_mutex;
+static thread_local bool g_is_hooking = false; // 防递归锁
+
 static std::string generate_fake_meminfo() {
+    std::lock_guard<std::mutex> lock(g_meminfo_mutex);
+    time_t now = time(nullptr);
+    
+    // 如果 3 秒内已经生成过，直接返回缓存，避免频繁读文件和重复计算
+    if (!g_cached_meminfo.empty() && (now - g_last_update_time < 3)) {
+        return g_cached_meminfo;
+    }
+
+    // 开启防递归标志，标记当前正在读取真实文件，跳过拦截
+    g_is_hooking = true;
     FILE *fp = fopen("/proc/meminfo", "r");
-    if (!fp) return "";
+    g_is_hooking = false;
+
+    if (!fp) return g_cached_meminfo; // 如果读取失败，返回旧缓存兜底
 
     char line[256];
     std::map<std::string, unsigned long long> memMap;
@@ -202,7 +220,10 @@ static std::string generate_fake_meminfo() {
             newContent += l;
         }
     }
-    return newContent;
+
+    g_cached_meminfo = newContent;
+    g_last_update_time = now;
+    return g_cached_meminfo;
 }
 
 static int create_fake_meminfo_fd() {
@@ -219,7 +240,7 @@ static int create_fake_meminfo_fd() {
 
 static int (*orig_openat)(int dirfd, const char *pathname, int flags, mode_t mode) = nullptr;
 static int my_openat(int dirfd, const char *pathname, int flags, mode_t mode) {
-    if (pathname != nullptr && strcmp(pathname, "/proc/meminfo") == 0) {
+    if (!g_is_hooking && pathname != nullptr && strcmp(pathname, "/proc/meminfo") == 0) {
         int fake_fd = create_fake_meminfo_fd();
         if (fake_fd >= 0) return fake_fd;
     }
@@ -228,7 +249,7 @@ static int my_openat(int dirfd, const char *pathname, int flags, mode_t mode) {
 
 static int (*orig_open)(const char *pathname, int flags, mode_t mode) = nullptr;
 static int my_open(const char *pathname, int flags, mode_t mode) {
-    if (pathname != nullptr && strcmp(pathname, "/proc/meminfo") == 0) {
+    if (!g_is_hooking && pathname != nullptr && strcmp(pathname, "/proc/meminfo") == 0) {
         int fake_fd = create_fake_meminfo_fd();
         if (fake_fd >= 0) return fake_fd;
     }
