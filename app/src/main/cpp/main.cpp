@@ -135,17 +135,15 @@ static std::string generate_fake_meminfo() {
     std::lock_guard<std::mutex> lock(g_meminfo_mutex);
     time_t now = time(nullptr);
     
-    // 如果 3 秒内已经生成过，直接返回缓存，避免频繁读文件和重复计算
     if (!g_cached_meminfo.empty() && (now - g_last_update_time < 3)) {
         return g_cached_meminfo;
     }
 
-    // 开启防递归标志，标记当前正在读取真实文件，跳过拦截
     g_is_hooking = true;
     FILE *fp = fopen("/proc/meminfo", "r");
     g_is_hooking = false;
 
-    if (!fp) return g_cached_meminfo; // 如果读取失败，返回旧缓存兜底
+    if (!fp) return g_cached_meminfo;
 
     char line[256];
     std::map<std::string, unsigned long long> memMap;
@@ -240,7 +238,12 @@ static int create_fake_meminfo_fd() {
 
 static int (*orig_openat)(int dirfd, const char *pathname, int flags, mode_t mode) = nullptr;
 static int my_openat(int dirfd, const char *pathname, int flags, mode_t mode) {
+    if (pathname != nullptr && strstr(pathname, "meminfo") != nullptr) {
+        LOGD("[*] 捕获到目标路径包含 meminfo: %s (g_is_hooking: %d)", pathname, g_is_hooking);
+    }
+
     if (!g_is_hooking && pathname != nullptr && strcmp(pathname, "/proc/meminfo") == 0) {
+        LOGD("[+] 成功拦截并伪装 /proc/meminfo 数据！");
         int fake_fd = create_fake_meminfo_fd();
         if (fake_fd >= 0) return fake_fd;
     }
@@ -250,6 +253,7 @@ static int my_openat(int dirfd, const char *pathname, int flags, mode_t mode) {
 static int (*orig_open)(const char *pathname, int flags, mode_t mode) = nullptr;
 static int my_open(const char *pathname, int flags, mode_t mode) {
     if (!g_is_hooking && pathname != nullptr && strcmp(pathname, "/proc/meminfo") == 0) {
+        LOGD("[+] 成功拦截并伪装 /proc/meminfo 数据 (open)！");
         int fake_fd = create_fake_meminfo_fd();
         if (fake_fd >= 0) return fake_fd;
     }
@@ -334,6 +338,9 @@ public:
             return;
         }
 
+        // 双保险：在子进程专有化前挂载 Hook
+        doHook();
+
         auto rawProcess = env->GetStringUTFChars(args->nice_name, nullptr);
         auto rawDir = env->GetStringUTFChars(args->app_data_dir, nullptr);
 
@@ -372,9 +379,9 @@ public:
     }
 
     void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
+        doHook(); // 再次确保主线程生效
         if (dexVector.empty()) return;
 
-        doHook();
         inject();
 
         dexVector.clear();
