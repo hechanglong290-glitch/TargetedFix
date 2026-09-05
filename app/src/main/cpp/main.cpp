@@ -1,332 +1,273 @@
-package es.chiteroman.playintegrityfix;
+#include <android/log.h>
+#include <sys/system_properties.h>
+#include <unistd.h>
+#include <vector>
+#include <string>
+#include <algorithm>
+#include <cctype>
+#include <map>
+#include <cstdio>
+#include <sys/statvfs.h>
+#include <sys/vfs.h>
 
-import android.content.pm.PackageInfo;
-import android.content.pm.PackageManager;
-import android.content.pm.Signature;
-import android.os.Build;
-import android.os.Parcel;
-import android.os.Parcelable;
-import android.util.Base64;
-import android.util.JsonReader;
-import android.util.Log;
+#include "zygisk.hpp"
+#include "json/single_include/nlohmann/json.hpp"
+#include "dobby.h"
 
-import org.lsposed.hiddenapibypass.HiddenApiBypass;
+#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, "TFIX/Native", __VA_ARGS__)
+#define DEX_FILE_PATH "/data/adb/modules/targetedfix/classes.dex"
 
-import java.io.IOException;
-import java.io.StringReader;
-import java.lang.reflect.Field;
-import java.lang.reflect.Method;
-import java.security.KeyStore;
-import java.security.KeyStoreException;
-import java.security.KeyStoreSpi;
-import java.security.Provider;
-import java.security.Security;
-import java.util.HashMap;
-import java.util.Map;
+// 硬编码伪装容量参数：512GB 总空间，256GB 剩余空间
+static constexpr uint64_t FAKE_TOTAL_GB = 512; 
+static constexpr uint64_t FAKE_FREE_GB  = 256;
 
-public final class EntryPoint {
-    private static Integer verboseLogs = 0;
-    private static Integer spoofBuildEnabled = 1;
+static bool spoofStorage = (FAKE_TOTAL_GB > 0);
+static const uint64_t FAKE_BLOCK_SIZE = 4096;
+static fsblkcnt_t fakeTotalBlocks = (FAKE_TOTAL_GB * 1024ULL * 1024ULL * 1024ULL) / FAKE_BLOCK_SIZE;
+static fsblkcnt_t fakeFreeBlocks  = (FAKE_FREE_GB * 1024ULL * 1024ULL * 1024ULL) / FAKE_BLOCK_SIZE;
 
-    private static final String signatureData = "MIIFyTCCA7GgAwIBAgIVALyxxl+zDS9SL68SzOr48309eAZyMA0GCSqGSIb3DQEBCwUAMHQxCzAJ\n" +
-            "BgNVBAYTAlVTMRMwEQYDVQQIEwpDYWxpZm9ybmlhMRYwFAYDVQQHEw1Nb3VudGFpbiBWaWV3MRQw\n" +
-            "EgYDVQQKEwtHb29nbGUgSW5jLjEQMA4GA1UECxMHQW5kcm9pZDEQMA4GA1UEAxMHQW5kcm9pZDAg\n" +
-            "Fw0yMjExMDExODExMzVaGA8yMDUyMTEwMTE4MTEzNVowdDELMAkGA1UEBhMCVVMxEzARBgNVBAgT\n" +
-            "CkNhbGlmb3JuaWExFjAUBgNVBAcTDU1vdW50YWluIFZpZXcxFDASBgNVBAoTC0dvb2dsZSBJbmMu\n" +
-            "MRAwDgYDVQQLEwdBbmRyb2lkMRAwDgYDVQQDEwdBbmRyb2lkMIICIjANBgkqhkiG9w0BAQEFAAOC\n" +
-            "Ag8AMIICCgKCAgEAsqtalIy/nctKlrhd1UVoDffFGnDf9GLi0QQhsVoJkfF16vDDydZJOycG7/kQ\n" +
-            "ziRZhFdcoMrIYZzzw0ppBjsSe1AiWMuKXwTBaEtxN99S1xsJiW4/QMI6N6kMunydWRMsbJ6aAxi1\n" +
-            "lVq0bxSwr8Sg/8u9HGVivfdG8OpUM+qjuV5gey5xttNLK3BZDrAlco8RkJZryAD40flmJZrWXJmc\n" +
-            "r2HhJJUnqG4Z3MSziEgW1u1JnnY3f/BFdgYsA54SgdUGdQP3aqzSjIpGK01/vjrXvifHazSANjvl\n" +
-            "0AUE5i6AarMw2biEKB2ySUDp8idC5w12GpqDrhZ/QkW8yBSa87KbkMYXuRA2Gq1fYbQx3YJraw0U\n" +
-            "gZ4M3fFKpt6raxxM5j0sWHlULD7dAZMERvNESVrKG3tQ7B39WAD8QLGYc45DFEGOhKv5Fv8510h5\n" +
-            "sXK502IvGpI4FDwz2rbtAgJ0j+16db5wCSW5ThvNPhCheyciajc8dU1B5tJzZN/ksBpzne4Xf9gO\n" +
-            "LZ9ZU0+3Z5gHVvTS/YpxBFwiFpmL7dvGxew0cXGSsG5UTBlgr7i0SX0WhY4Djjo8IfPwrvvA0QaC\n" +
-            "FamdYXKqBsSHgEyXS9zgGIFPt2jWdhaS+sAa//5SXcWro0OdiKPuwEzLgj759ke1sHRnvO735dYn\n" +
-            "5whVbzlGyLBh3L0CAwEAAaNQME4wDAYDVR0TBAUwAwEB/zAdBgNVHQ4EFgQUU1eXQ7NoYKjvOQlh\n" +
-            "5V8jHQMoxA8wHwYDVR0jBBgwFoAUU1eXQ7NoYKjvOQlh5V8jHQMoxA8wDQYJKoZIhvcNAQELBQAD\n" +
-            "ggIBAHFIazRLs3itnZKllPnboSd6sHbzeJURKehx8GJPvIC+xWlwWyFO5+GHmgc3yh/SVd3Xja/k\n" +
-            "8Ud59WEYTjyJJWTw0Jygx37rHW7VGn2HDuy/x0D+els+S8HeLD1toPFMepjIXJn7nHLhtmzTPlDW\n" +
-            "DrhiaYsls/k5Izf89xYnI4euuOY2+1gsweJqFGfbznqyqy8xLyzoZ6bvBJtgeY+G3i/9Be14HseS\n" +
-            "Na4FvI1Oze/l2gUu1IXzN6DGWR/lxEyt+TncJfBGKbjafYrfSh3zsE4N3TU7BeOL5INirOMjre/j\n" +
-            "VgB1YQG5qLVaPoz6mdn75AbBBm5a5ahApLiKqzy/hP+1rWgw8Ikb7vbUqov/bnY3IlIU6XcPJTCD\n" +
-            "b9aRZQkStvYpQd82XTyxD/T0GgRLnUj5Uv6iZlikFx1KNj0YNS2T3gyvL++J9B0Y6gAkiG0EtNpl\n" +
-            "z7Pomsv5pVdmHVdKMjqWw5/6zYzVmu5cXFtR384Ti1qwML1xkD6TC3VIv88rKIEjrkY2c+v1frh9\n" +
-            "fRJ2OmzXmML9NgHTjEiJR2Ib2iNrMKxkuTIs9oxKZgrJtJKvdU9qJJKM5PnZuNuHhGs6A/9gt9Oc\n" +
-            "cetYeQvVSqeEmQluWfcunQn9C9Vwi2BJIiVJh4IdWZf5/e2PlSSQ9CJjz2bKI17pzdxOmjQfE0JS\n" +
-            "F7Xt\n";
+typedef void (*T_Callback)(void *, const char *, const char *, uint32_t);
+static std::map<void *, T_Callback> callbacks;
 
-    private static final Map<String, String> map = new HashMap<>();
+static void modify_callback(void *cookie, const char *name, const char *value, uint32_t serial) {
+    if (cookie == nullptr || name == nullptr || value == nullptr || !callbacks.contains(cookie)) return;
+    return callbacks[cookie](cookie, name, value, serial);
+}
 
-    public static Integer getVerboseLogs() {
-        return verboseLogs;
+static void (*o_system_property_read_callback)(const prop_info *, T_Callback, void *);
+
+static void my_system_property_read_callback(const prop_info *pi, T_Callback callback, void *cookie) {
+    if (pi == nullptr || callback == nullptr || cookie == nullptr) {
+        return o_system_property_read_callback(pi, callback, cookie);
+    }
+    callbacks[cookie] = callback;
+    return o_system_property_read_callback(pi, modify_callback, cookie);
+}
+
+// ==================== statvfs / statfs / 64位 全路线 Hook 逻辑 ====================
+static int (*orig_statvfs)(const char *path, struct statvfs *buf) = nullptr;
+static int (*orig_statfs)(const char *path, struct statfs *buf) = nullptr;
+
+static inline bool is_user_storage_path(const char *path) {
+    if (!path) return false;
+    return (strncmp(path, "/data", 5) == 0 || 
+            strncmp(path, "/storage", 8) == 0 || 
+            strncmp(path, "/sdcard", 7) == 0 ||
+            strncmp(path, "/mnt", 4) == 0 ||
+            strcmp(path, "/") == 0);
+}
+
+static int my_statvfs(const char *path, struct statvfs *buf) {
+    int result = orig_statvfs(path, buf);
+    if (result == 0 && buf != nullptr && spoofStorage && is_user_storage_path(path)) {
+        buf->f_bsize   = FAKE_BLOCK_SIZE;
+        buf->f_frsize  = FAKE_BLOCK_SIZE;
+        buf->f_blocks  = fakeTotalBlocks;
+        buf->f_bfree   = fakeFreeBlocks;
+        buf->f_bavail  = fakeFreeBlocks;
+    }
+    return result;
+}
+
+static int my_statfs(const char *path, struct statfs *buf) {
+    int result = orig_statfs(path, buf);
+    if (result == 0 && buf != nullptr && spoofStorage && is_user_storage_path(path)) {
+        buf->f_bsize  = FAKE_BLOCK_SIZE;
+        buf->f_blocks = fakeTotalBlocks;
+        buf->f_bfree  = fakeFreeBlocks;
+        buf->f_bavail = fakeFreeBlocks;
+    }
+    return result;
+}
+
+static void doHook() {
+    void *handle = DobbySymbolResolver(nullptr, "__system_property_read_callback");
+    if (handle != nullptr) {
+        DobbyHook(handle, reinterpret_cast<dobby_dummy_func_t>(my_system_property_read_callback),
+                  reinterpret_cast<dobby_dummy_func_t *>(&o_system_property_read_callback));
     }
 
-    public static Integer getSpoofBuildEnabled() {
-        return spoofBuildEnabled;
-    }
-
-    public static void init(int logLevel, int spoofBuildVal, int spoofProviderVal, int spoofSignatureVal) {
-		if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            HiddenApiBypass.addHiddenApiExemptions("");
-        }
-        verboseLogs = logLevel;
-        spoofBuildEnabled = spoofBuildVal;
-        if (verboseLogs > 99) logFields();
-        if (spoofProviderVal > 0) spoofProvider();
-        if (spoofBuildVal > 0) spoofDevice();
-        if (spoofSignatureVal > 0) spoofPackageManager();
-    }
-
-    public static void receiveJson(String data) {
-        try (JsonReader reader = new JsonReader(new StringReader(data))) {
-            reader.beginObject();
-            while (reader.hasNext()) {
-                map.put(reader.nextName(), reader.nextString());
-            }
-            reader.endObject();
-        } catch (IOException|IllegalStateException e) {
-            LOG("Couldn't read JSON from Zygisk: " + e);
-            map.clear();
-            return;
-        }
-    }
-
-    private static void spoofProvider() {
-        final String KEYSTORE = "AndroidKeyStore";
-
-        try {
-            Provider provider = Security.getProvider(KEYSTORE);
-            KeyStore keyStore = KeyStore.getInstance(KEYSTORE);
-
-            Field f = keyStore.getClass().getDeclaredField("keyStoreSpi");
-            f.setAccessible(true);
-            CustomKeyStoreSpi.keyStoreSpi = (KeyStoreSpi) f.get(keyStore);
-            f.setAccessible(false);
-
-            CustomProvider customProvider = new CustomProvider(provider);
-            Security.removeProvider(KEYSTORE);
-            Security.insertProviderAt(customProvider, 1);
-
-            LOG("Spoof KeyStoreSpi and Provider done!");
-
-        } catch (KeyStoreException e) {
-            LOG("Couldn't find KeyStore: " + e);
-        } catch (NoSuchFieldException e) {
-            LOG("Couldn't find field: " + e);
-        } catch (IllegalAccessException e) {
-            LOG("Couldn't change access of field: " + e);
-        }
-    }
-
-    static void spoofDevice() {
-        for (String key : map.keySet()) {
-            setField(key, map.get(key));
-        }
-    }
-
-    private static void spoofPackageManager() {
-        Signature spoofedSignature = new Signature(Base64.decode(signatureData, Base64.DEFAULT));
-        Parcelable.Creator<PackageInfo> originalCreator = PackageInfo.CREATOR;
-        Parcelable.Creator<PackageInfo> customCreator = new CustomPackageInfoCreator(originalCreator, spoofedSignature);
-
-        try {
-            Field creatorField = findField(PackageInfo.class, "CREATOR");
-            creatorField.setAccessible(true);
-            creatorField.set(null, customCreator);
-        } catch (Exception e) {
-            LOG("Couldn't replace PackageInfoCreator: " + e);
+    if (spoofStorage) {
+        void* statvfs_ptr = DobbySymbolResolver(nullptr, "statvfs");
+        if (!statvfs_ptr) statvfs_ptr = DobbySymbolResolver(nullptr, "statvfs64");
+        if (statvfs_ptr) {
+            DobbyHook(statvfs_ptr, reinterpret_cast<dobby_dummy_func_t>(my_statvfs),
+                      reinterpret_cast<dobby_dummy_func_t*>(&orig_statvfs));
         }
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            HiddenApiBypass.addHiddenApiExemptions("Landroid/os/Parcel;", "Landroid/content/pm", "Landroid/app");
+        void* statfs_ptr = DobbySymbolResolver(nullptr, "statfs");
+        if (!statfs_ptr) statfs_ptr = DobbySymbolResolver(nullptr, "statfs64");
+        if (statfs_ptr) {
+            DobbyHook(statfs_ptr, reinterpret_cast<dobby_dummy_func_t>(my_statfs),
+                      reinterpret_cast<dobby_dummy_func_t*>(&orig_statfs));
         }
-
-        try {
-            Field cacheField = findField(PackageManager.class, "sPackageInfoCache");
-            cacheField.setAccessible(true);
-            Object cache = cacheField.get(null);
-            Method clearMethod = cache.getClass().getMethod("clear");
-            clearMethod.invoke(cache);
-        } catch (Exception e) {
-            LOG("Couldn't clear PackageInfoCache: " + e);
-        }
-
-        try {
-            Field creatorsField = findField(Parcel.class, "mCreators");
-            creatorsField.setAccessible(true);
-            Map<?, ?> mCreators = (Map<?, ?>) creatorsField.get(null);
-            mCreators.clear();
-        } catch (Exception e) {
-            LOG("Couldn't clear Parcel mCreators: " + e);
-        }
-
-        try {
-            Field creatorsField = findField(Parcel.class, "sPairedCreators");
-            creatorsField.setAccessible(true);
-            Map<?, ?> sPairedCreators = (Map<?, ?>) creatorsField.get(null);
-            sPairedCreators.clear();
-        } catch (Exception e) {
-            LOG("Couldn't clear Parcel sPairedCreators: " + e);
-        }
-    }
-
-    private static Field findField(Class<?> currentClass, String fieldName) throws NoSuchFieldException {
-        while (currentClass != null && !currentClass.equals(Object.class)) {
-            try {
-                return currentClass.getDeclaredField(fieldName);
-            } catch (NoSuchFieldException e) {
-                currentClass = currentClass.getSuperclass();
-            }
-        }
-        throw new NoSuchFieldException("Field '" + fieldName + "' not found in class hierarchy of " + currentClass.getName());
-    }
-
-    private static boolean classContainsField(Class className, String fieldName) {
-        for (Field field : className.getDeclaredFields()) {
-            if (field.getName().equals(fieldName)) return true;
-        }
-        return false;
-    }
-	
-	private static void stripFinal(Field field, String name) {
-        try {
-            Field accessFlagsField = Field.class.getDeclaredField("accessFlags");
-            accessFlagsField.setAccessible(true);
-            accessFlagsField.setInt(field, field.getModifiers() & ~java.lang.reflect.Modifier.FINAL);
-        } catch (NoSuchFieldException | IllegalAccessException e) {
-            LOG(String.format("Couldn't modify accessFlags for '%s': " + e, name));
-        }
-    }
-
-    private static void setField(String name, String value) {
-        if (value.isEmpty()) {
-            try {
-                Field field;
-                if (classContainsField(Build.class, name)) {
-                    field = Build.class.getDeclaredField(name);
-                } else if (classContainsField(Build.VERSION.class, name)) {
-                    field = Build.VERSION.class.getDeclaredField(name);
-                } else {
-                    LOG(String.format("Couldn't determine '%s' class name", name));
-                    return;
-                }
-
-                field.setAccessible(true);
-				stripFinal(field, name);
-                Class<?> fieldType = field.getType();
-
-                if (fieldType == String.class) {
-                    setFieldNative(field.getDeclaringClass(), field, fieldType.getName(), "");
-                    LOG(String.format("[%s]: Cleared (set to empty string)", name));
-                } else if (fieldType == int.class) {
-                    setFieldNative(field.getDeclaringClass(), field, fieldType.getName(), Integer.valueOf(0));
-                    LOG(String.format("[%s]: Cleared (set to 0)", name));
-                } else if (fieldType == long.class) {
-                    setFieldNative(field.getDeclaringClass(), field, fieldType.getName(), Long.valueOf(0L));
-                    LOG(String.format("[%s]: Cleared (set to 0L)", name));
-                } else if (fieldType == boolean.class) {
-                    setFieldNative(field.getDeclaringClass(), field, fieldType.getName(), Boolean.valueOf(false));
-                    LOG(String.format("[%s]: Cleared (set to false)", name));
-                } else {
-                    LOG(String.format("[%s]: Unknown type %s, not cleared", name, fieldType));
-                }
-            } catch (Exception e) {
-                LOG(String.format("Error resetting field '%s': %s", name, e));
-            }
-            return;
-        }
-
-        Field field = null;
-        String oldValue = null;
-        Object newValue = null;
-
-        try {
-            if (classContainsField(Build.class, name)) {
-                field = Build.class.getDeclaredField(name);
-            } else if (classContainsField(Build.VERSION.class, name)) {
-                field = Build.VERSION.class.getDeclaredField(name);
-            } else {
-                if (verboseLogs > 1) LOG(String.format("Couldn't determine '%s' class name", name));
-                return;
-            }
-        } catch (NoSuchFieldException e) {
-            LOG(String.format("Couldn't find '%s' field name: " + e, name));
-            return;
-        }
-        field.setAccessible(true);
-		stripFinal(field, name);
-		Class<?> fieldType = field.getType();
-		try {
-            Object rawOld = field.get(null);
-            oldValue = (fieldType == String[].class)
-                ? String.join(", ", (String[]) rawOld)
-                : String.valueOf(rawOld);
-        } catch (IllegalAccessException e) {
-            LOG(String.format("Couldn't access '%s' field value: " + e, name));
-            return;
-        }
-        if (value.equals(oldValue)) {
-            if (verboseLogs > 2) LOG(String.format("[%s]: %s (unchanged)", name, value));
-            return;
-        }
-        if (fieldType == String.class) {
-            newValue = value;
-        } else if (fieldType == int.class) {
-            try {
-                newValue = Integer.parseInt(value);
-            } catch (NumberFormatException e) {
-                LOG(String.format("Invalid int value '%s' for field '%s'", value, name));
-                return;
-            }
-        } else if (fieldType == long.class) {
-            try {
-                newValue = Long.parseLong(value);
-            } catch (NumberFormatException e) {
-                LOG(String.format("Invalid long value '%s' for field '%s'", value, name));
-                return;
-            }
-        } else if (fieldType == boolean.class) {
-            newValue = Boolean.parseBoolean(value);
-		} else if (fieldType == String[].class) {
-            newValue = value.split(",");
-        } else {
-            LOG(String.format("Couldn't convert '%s' to '%s' type", value, fieldType));
-            return;
-        }
-        try {
-            setFieldNative(field.getDeclaringClass(), field, fieldType.getName(), newValue);
-        } catch (Exception e) {
-            LOG(String.format("Native setField failed for '%s': " + e, name));
-        }
-        LOG(String.format("[%s]: %s -> %s", name, oldValue,
-            fieldType == String[].class ? String.join(", ", (String[]) newValue) : value));
-    }
-	
-	private static native void setFieldNative(Class<?> targetClass, Field field, String type, Object value);
-
-    private static String logParseField(Field field) {
-        Object value = null;
-        String type = field.getType().getName();
-        String name = field.getName();
-        try {
-            value = field.get(null);
-        } catch (IllegalAccessException|NullPointerException e) {
-            return String.format("Couldn't access '%s' field value: " + e, name);
-        }
-        return String.format("<%s> %s: %s", type, name, String.valueOf(value));
-    }
-
-    private static void logFields() {
-        for (Field field : Build.class.getDeclaredFields()) {
-            LOG("Build " + logParseField(field));
-        }
-        for (Field field : Build.VERSION.class.getDeclaredFields()) {
-            LOG("Build.VERSION " + logParseField(field));
-        }
-    }
-
-    static void LOG(String msg) {
-        Log.d("TFIX/Java:APP", msg);
     }
 }
+
+static void setFieldNative(JNIEnv *env, jclass, jclass targetClass, jobject fieldObj, jstring typeObj, jobject valueObj) {
+    if (!targetClass || !fieldObj || !typeObj) return;
+
+    jfieldID fieldID = env->FromReflectedField(fieldObj);
+    if (!fieldID) return;
+
+    const char *typeName = env->GetStringUTFChars(typeObj, nullptr);
+
+    if (strcmp(typeName, "java.lang.String") == 0) {
+        env->SetStaticObjectField(targetClass, fieldID, valueObj);
+    } else if (strcmp(typeName, "int") == 0) {
+        jclass intClass = env->FindClass("java/lang/Integer");
+        jmethodID intValue = env->GetMethodID(intClass, "intValue", "()I");
+        env->SetStaticIntField(targetClass, fieldID, env->CallIntMethod(valueObj, intValue));
+    } else if (strcmp(typeName, "long") == 0) {
+        jclass longClass = env->FindClass("java/lang/Long");
+        jmethodID longValue = env->GetMethodID(longClass, "longValue", "()J");
+        env->SetStaticLongField(targetClass, fieldID, env->CallLongMethod(valueObj, longValue));
+    } else if (strcmp(typeName, "boolean") == 0) {
+        jclass boolClass = env->FindClass("java/lang/Boolean");
+        jmethodID booleanValue = env->GetMethodID(boolClass, "booleanValue", "()Z");
+        env->SetStaticBooleanField(targetClass, fieldID, env->CallBooleanMethod(valueObj, booleanValue));
+    } else if (strcmp(typeName, "[Ljava.lang.String;") == 0) {
+        env->SetStaticObjectField(targetClass, fieldID, valueObj);
+    }
+
+    env->ReleaseStringUTFChars(typeObj, typeName);
+}
+
+class TargetedFix : public zygisk::ModuleBase {
+public:
+    void onLoad(zygisk::Api *api, JNIEnv *env) override {
+        this->api = api;
+        this->env = env;
+    }
+
+    void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
+        bool shouldSpoof = false;
+        auto rawProcess = env->GetStringUTFChars(args->nice_name, nullptr);
+        auto rawDir = env->GetStringUTFChars(args->app_data_dir, nullptr);
+
+        if (rawDir == nullptr || rawProcess == nullptr) {
+            if (rawProcess) env->ReleaseStringUTFChars(args->nice_name, rawProcess);
+            if (rawDir) env->ReleaseStringUTFChars(args->app_data_dir, rawDir);
+            api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
+            return;
+        }
+
+        std::string processStr(rawProcess);
+
+        // 包含设置界面（com.android.settings）与核心进程拦截
+        if (processStr != "android" && 
+            processStr.find("android.process") == std::string::npos &&
+            processStr.find("com.android.systemui") == std::string::npos) {
+            shouldSpoof = true; 
+        }
+
+        env->ReleaseStringUTFChars(args->nice_name, rawProcess);
+        env->ReleaseStringUTFChars(args->app_data_dir, rawDir);
+
+        if (!shouldSpoof) {
+            api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
+            return;
+        }
+
+        api->setOption(zygisk::FORCE_DENYLIST_UNMOUNT);
+
+        long dexSize = 0;
+        int fd = api->connectCompanion();
+
+        long processSize = processStr.size();
+        write(fd, &processSize, sizeof(long));
+        write(fd, processStr.data(), processSize);
+
+        read(fd, &dexSize, sizeof(long));
+
+        if (dexSize < 1) {
+            close(fd);
+            api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
+            return;
+        }
+
+        dexVector.resize(dexSize);
+        read(fd, dexVector.data(), dexSize);
+        close(fd);
+    }
+
+    void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
+        if (dexVector.empty()) return;
+
+        doHook();
+        inject();
+
+        dexVector.clear();
+    }
+
+    void preServerSpecialize(zygisk::ServerSpecializeArgs *args) override {
+        api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
+    }
+
+private:
+    zygisk::Api *api = nullptr;
+    JNIEnv *env = nullptr;
+    std::vector<char> dexVector;
+
+    void inject() {
+        auto clClass = env->FindClass("java/lang/ClassLoader");
+        auto getSystemClassLoader = env->GetStaticMethodID(clClass, "getSystemClassLoader", "()Ljava/lang/ClassLoader;");
+        auto systemClassLoader = env->CallStaticObjectMethod(clClass, getSystemClassLoader);
+
+        auto dexClClass = env->FindClass("dalvik/system/InMemoryDexClassLoader");
+        auto dexClInit = env->GetMethodID(dexClClass, "<init>", "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V");
+        auto buffer = env->NewDirectByteBuffer(dexVector.data(), static_cast<jlong>(dexVector.size()));
+        auto dexCl = env->NewObject(dexClClass, dexClInit, buffer, systemClassLoader);
+
+        auto loadClass = env->GetMethodID(clClass, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");        
+        const char* className = "es.chiteroman.playintegrityfix.EntryPoint";
+        auto entryClassName = env->NewStringUTF(className);
+        auto entryClassObj = env->CallObjectMethod(dexCl, loadClass, entryClassName);
+
+        auto entryClass = (jclass) entryClassObj;
+
+        JNINativeMethod methods[] = {
+            {"setFieldNative", "(Ljava/lang/Class;Ljava/lang/reflect/Field;Ljava/lang/String;Ljava/lang/Object;)V", (void*) setFieldNative}
+        };
+        env->RegisterNatives(entryClass, methods, 1);
+
+        auto entryInit = env->GetStaticMethodID(entryClass, "init", "(IIII)V");
+        env->CallStaticVoidMethod(entryClass, entryInit, 0, 1, 0, 0);
+
+        env->DeleteLocalRef(clClass);
+        env->DeleteLocalRef(dexClClass);
+        env->DeleteLocalRef(systemClassLoader);
+        env->DeleteLocalRef(dexCl);
+        env->DeleteLocalRef(buffer);
+        env->DeleteLocalRef(entryClassName);
+        env->DeleteLocalRef(entryClassObj);
+    }
+};
+
+static void companion(int fd) {
+    long dexSize = 0;
+    std::vector<char> dexVector;
+
+    long processSize = 0;
+    read(fd, &processSize, sizeof(long));
+    std::string processName;
+    processName.resize(processSize);
+    read(fd, processName.data(), processSize);
+
+    FILE *dex = fopen(DEX_FILE_PATH, "rb");
+    if (dex) {
+        fseek(dex, 0, SEEK_END);
+        dexSize = ftell(dex);
+        fseek(dex, 0, SEEK_SET);
+
+        dexVector.resize(dexSize);
+        fread(dexVector.data(), 1, dexSize, dex);
+        fclose(dex);
+    }
+
+    write(fd, &dexSize, sizeof(long));
+    write(fd, dexVector.data(), dexSize);
+}
+
+REGISTER_ZYGISK_MODULE(TargetedFix)
+REGISTER_ZYGISK_COMPANION(companion)
