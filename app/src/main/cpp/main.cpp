@@ -7,12 +7,11 @@
 #include <cctype>
 #include <map>
 #include <cstdio>
+#include <cstring>
 #include <sys/statvfs.h>
 #include <sys/vfs.h>
 #include <sys/sysinfo.h>
 #include <fcntl.h>
-#include <sstream>
-#include <fstream>
 
 #include "zygisk.hpp"
 #include "json/single_include/nlohmann/json.hpp"
@@ -21,7 +20,7 @@
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, "TFIX/Native", __VA_ARGS__)
 #define DEX_FILE_PATH "/data/adb/modules/targetedfix/classes.dex"
 
-// 硬编码伪装容量参数：32GB 总存储空间
+// 硬编码伪装参数：32GB 总存储空间
 static constexpr uint64_t FAKE_TOTAL_GB = 32; 
 
 static bool spoofStorage = (FAKE_TOTAL_GB > 0);
@@ -52,7 +51,7 @@ static void my_system_property_read_callback(const prop_info *pi, T_Callback cal
     return o_system_property_read_callback(pi, modify_callback, cookie);
 }
 
-// ==================== statvfs / statfs / 64位 全路线 Hook 逻辑 ====================
+// ==================== statvfs / statfs 存储 Hook 逻辑 ====================
 static int (*orig_statvfs)(const char *path, struct statvfs *buf) = nullptr;
 static int (*orig_statfs)(const char *path, struct statfs *buf) = nullptr;
 
@@ -133,41 +132,45 @@ static int my_sysinfo(struct sysinfo *info) {
     return res;
 }
 
-// 2. /proc/meminfo 文件 Hook (openat / open 管道重定向)
+// 2. /proc/meminfo 文件 Hook (纯 C FILE* 解析，无 C++ iostream 依赖)
 static int (*orig_openat)(int dirfd, const char *pathname, int flags, mode_t mode) = nullptr;
 
 static std::string generate_fake_meminfo() {
-    std::ifstream realMeminfo("/proc/meminfo");
-    if (!realMeminfo.is_open()) return "";
+    FILE *fp = fopen("/proc/meminfo", "r");
+    if (!fp) return "";
 
-    std::string line;
-    std::ostringstream newContent;
+    char line[256];
+    std::string newContent;
+    newContent.reserve(4096);
 
-    while (std::getline(realMeminfo, line)) {
-        if (line.rfind("MemTotal:", 0) == 0) {
-            newContent << "MemTotal:       " << FAKE_RAM_TOTAL_KB << " kB\n";
+    while (fgets(line, sizeof(line), fp)) {
+        if (strncmp(line, "MemTotal:", 9) == 0) {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "MemTotal:       %8llu kB\n", (unsigned long long)FAKE_RAM_TOTAL_KB);
+            newContent += buf;
         } 
-        else if (line.rfind("MemFree:", 0) == 0 || 
-                 line.rfind("MemAvailable:", 0) == 0 || 
-                 line.rfind("Buffers:", 0) == 0 || 
-                 line.rfind("Cached:", 0) == 0) {
+        else if (strncmp(line, "MemFree:", 8) == 0 || 
+                 strncmp(line, "MemAvailable:", 13) == 0 || 
+                 strncmp(line, "Buffers:", 8) == 0 || 
+                 strncmp(line, "Cached:", 7) == 0) {
             
             char key[64] = {0};
-            uint64_t realKb = 0;
-            sscanf(line.c_str(), "%63s %20lu", key, &realKb);
+            unsigned long long realKb = 0;
+            sscanf(line, "%63s %20llu", key, &realKb);
 
-            uint64_t fakeKb = realKb * RAM_MULTIPLIER;
+            unsigned long long fakeKb = realKb * RAM_MULTIPLIER;
             if (fakeKb > FAKE_RAM_TOTAL_KB) fakeKb = FAKE_RAM_TOTAL_KB;
 
             char buf[128];
-            snprintf(buf, sizeof(buf), "%-16s%8lu kB\n", key, fakeKb);
-            newContent << buf;
+            snprintf(buf, sizeof(buf), "%-16s%8llu kB\n", key, fakeKb);
+            newContent += buf;
         } 
         else {
-            newContent << line << "\n";
+            newContent += line;
         }
     }
-    return newContent.str();
+    fclose(fp);
+    return newContent;
 }
 
 static int my_openat(int dirfd, const char *pathname, int flags, mode_t mode) {
@@ -177,8 +180,8 @@ static int my_openat(int dirfd, const char *pathname, int flags, mode_t mode) {
             int pipefds[2];
             if (pipe2(pipefds, O_CLOEXEC) == 0) {
                 write(pipefds[1], fakeData.c_str(), fakeData.size());
-                close(pipefds[1]); // 立即关闭写端，保证读端读取数据时不阻塞且立刻 EOF
-                return pipefds[0];  // 返回读端 fd
+                close(pipefds[1]); // 关闭写端，读端可读且达到 EOF 时即结束
+                return pipefds[0];  // 返回管道读端文件描述符
             }
         }
     }
