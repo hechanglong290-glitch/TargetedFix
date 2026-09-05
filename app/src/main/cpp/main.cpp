@@ -19,7 +19,6 @@
 #define DEX_FILE_PATH "/data/adb/modules/targetedfix/classes.dex"
 #define PROP_FILE_PATH "/data/adb/modules/targetedfix/config/fix.prop"
 #define JSON_FILE_PATH "/data/adb/modules/targetedfix/config/fix.json"
-#define TARGET_LIST_PATH "/data/adb/modules/targetedfix/config/target.txt"
 
 static int verboseLogs = 0;
 static int spoofBuild = 1;
@@ -81,7 +80,6 @@ static int (*orig_statfs)(const char *path, struct statfs *buf) = nullptr;
 
 static inline bool is_user_storage_path(const char *path) {
     if (!path) return false;
-    // 允许捕获所有常见的分区及挂载路径，防止 AIDA64 查询根目录或挂载点时漏掉
     return (strncmp(path, "/data", 5) == 0 || 
             strncmp(path, "/storage", 8) == 0 || 
             strncmp(path, "/sdcard", 7) == 0 ||
@@ -186,27 +184,42 @@ public:
         auto rawProcess = env->GetStringUTFChars(args->nice_name, nullptr);
         auto rawDir = env->GetStringUTFChars(args->app_data_dir, nullptr);
 
-        if (rawDir == nullptr) {
-            env->ReleaseStringUTFChars(args->nice_name, rawProcess);
+        if (rawDir == nullptr || rawProcess == nullptr) {
+            if (rawProcess) env->ReleaseStringUTFChars(args->nice_name, rawProcess);
+            if (rawDir) env->ReleaseStringUTFChars(args->app_data_dir, rawDir);
             api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
             return;
         }
 
         pkgName = rawProcess;
-        std::string_view process(rawProcess);
+        std::string processStr(rawProcess);
 
-        long dexSize = 0, jsonSize = 0, targetSize = 0;
+        // ==================== 全局 App 过滤（包含系统设置，排除底层系统进程） ====================
+        if (processStr != "android" && 
+            processStr.find("android.process") == std::string::npos &&
+            processStr.find("com.android.systemui") == std::string::npos) {
+            shouldSpoof = true; 
+        }
 
+        env->ReleaseStringUTFChars(args->nice_name, rawProcess);
+        env->ReleaseStringUTFChars(args->app_data_dir, rawDir);
+
+        if (!shouldSpoof) {
+            api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
+            return;
+        }
+
+        api->setOption(zygisk::FORCE_DENYLIST_UNMOUNT);
+
+        long dexSize = 0, jsonSize = 0;
         int fd = api->connectCompanion();
 
-        std::string processStr(process);
         long processSize = processStr.size();
         write(fd, &processSize, sizeof(long));
         write(fd, processStr.data(), processSize);
 
         read(fd, &dexSize, sizeof(long));
         read(fd, &jsonSize, sizeof(long));
-        read(fd, &targetSize, sizeof(long));
 
         if (dexSize < 1 || jsonSize < 1) {
             close(fd);
@@ -221,26 +234,7 @@ public:
         jsonVector.resize(jsonSize);
         read(fd, jsonVector.data(), jsonSize);
 
-        targetVector.resize(targetSize);
-        read(fd, targetVector.data(), targetSize);
-
         close(fd);
-
-        parseTargetVector();
-
-        if (isTargetPackage(process)) {
-            shouldSpoof = true;
-        }
-
-        env->ReleaseStringUTFChars(args->nice_name, rawProcess);
-        env->ReleaseStringUTFChars(args->app_data_dir, rawDir);
-
-        if (!shouldSpoof) {
-            api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
-            return;
-        }
-
-        api->setOption(zygisk::FORCE_DENYLIST_UNMOUNT);
 
         std::string configString(jsonVector.cbegin(), jsonVector.cend());
         jsonVector.clear();
@@ -264,7 +258,6 @@ public:
                     name = line.substr(0, propDelimiterPos);
                     value = line.substr(propDelimiterPos + 1);
                 } else {
-                    LOGD("Invalid prop entry, skipping");
                     continue;
                 }
                 size_t commentDelimiterPos = value.find(commentDelimiter);
@@ -297,8 +290,6 @@ public:
 
         dexVector.clear();
         json.clear();
-        targetVector.clear();
-        targetPackages.clear();
     }
 
     void preServerSpecialize(zygisk::ServerSpecializeArgs *args) override {
@@ -310,54 +301,8 @@ private:
     JNIEnv *env = nullptr;
     std::vector<char> dexVector;
     std::vector<char> jsonVector;
-    std::vector<char> targetVector;
     nlohmann::json json;
     std::string pkgName;
-    std::vector<std::string> targetPackages;
-
-    void parseTargetVector() {
-        if (targetVector.empty()) return;
-
-        size_t start = 0;
-        size_t totalSize = targetVector.size();
-
-        for (size_t i = 0; i <= totalSize; ++i) {
-            if (i == totalSize || targetVector[i] == '\n') {
-                processLineFromVector(start, i);
-                start = i + 1;
-            }
-        }
-    }
-
-    void processLineFromVector(size_t lineStart, size_t lineEnd) {
-        size_t start = lineStart;
-
-        while (start < lineEnd && (std::isspace((unsigned char)targetVector[start]) || targetVector[start] == '\r')) {
-            start++;
-        }
-
-        if (start >= lineEnd || targetVector[start] == '#') return;
-
-        size_t end = lineEnd;
-
-        while (end > start && (std::isspace((unsigned char)targetVector[end - 1]) || targetVector[end - 1] == '\r')) {
-            end--;
-        }
-
-        if (start < end) {
-            targetPackages.emplace_back(targetVector.data() + start, end - start);
-        }
-    }
-
-    bool isTargetPackage(std::string_view process) {
-        std::string processStr(process);
-        for (const auto &pkg : targetPackages) {
-            if (pkg == processStr) {
-                return true;
-            }
-        }
-        return false;
-    }
 
     void readJson() {
         LOGD("JSON contains %d keys!", static_cast<int>(json.size()));
@@ -401,7 +346,7 @@ private:
             if (!json["FAKE_TOTAL_GB"].is_null() && json["FAKE_TOTAL_GB"].is_string() && json["FAKE_TOTAL_GB"] != "") {
                 totalGb = std::stoull(json["FAKE_TOTAL_GB"].get<std::string>());
             }
-            json.erase("FAKE_TOTAL_GB"); // 移除后不影响整体逻辑
+            json.erase("FAKE_TOTAL_GB");
         }
         if (json.contains("FAKE_FREE_GB")) {
             if (!json["FAKE_FREE_GB"].is_null() && json["FAKE_FREE_GB"].is_string() && json["FAKE_FREE_GB"] != "") {
@@ -490,8 +435,8 @@ private:
 };
 
 static void companion(int fd) {
-    long dexSize = 0, jsonSize = 0, targetSize = 0;
-    std::vector<char> dexVector, jsonVector, targetVector;
+    long dexSize = 0, jsonSize = 0;
+    std::vector<char> dexVector, jsonVector;
 
     std::string processName;
     long processSize = 0;
@@ -542,25 +487,11 @@ static void companion(int fd) {
         fclose(json);
     }
 
-    FILE *target = fopen(TARGET_LIST_PATH, "r");
-    if (target) {
-        fseek(target, 0, SEEK_END);
-        targetSize = ftell(target);
-        fseek(target, 0, SEEK_SET);
-
-        targetVector.resize(targetSize);
-        fread(targetVector.data(), 1, targetSize, target);
-
-        fclose(target);
-    }
-
     write(fd, &dexSize, sizeof(long));
     write(fd, &jsonSize, sizeof(long));
-    write(fd, &targetSize, sizeof(long));
 
     write(fd, dexVector.data(), dexSize);
     write(fd, jsonVector.data(), jsonSize);
-    write(fd, targetVector.data(), targetSize);
 }
 
 REGISTER_ZYGISK_MODULE(TargetedFix)
