@@ -9,6 +9,10 @@
 #include <cstdio>
 #include <sys/statvfs.h>
 #include <sys/vfs.h>
+#include <sys/sysinfo.h>
+#include <fcntl.h>
+#include <sstream>
+#include <fstream>
 
 #include "zygisk.hpp"
 #include "json/single_include/nlohmann/json.hpp"
@@ -17,12 +21,18 @@
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, "TFIX/Native", __VA_ARGS__)
 #define DEX_FILE_PATH "/data/adb/modules/targetedfix/classes.dex"
 
-// 硬编码伪装容量参数：32GB 总空间
+// 硬编码伪装容量参数：32GB 总存储空间
 static constexpr uint64_t FAKE_TOTAL_GB = 32; 
 
 static bool spoofStorage = (FAKE_TOTAL_GB > 0);
 static const uint64_t FAKE_BLOCK_SIZE = 4096;
 static fsblkcnt_t fakeTotalBlocks = (FAKE_TOTAL_GB * 1024ULL * 1024ULL * 1024ULL) / FAKE_BLOCK_SIZE;
+
+// ==================== 内存 (RAM) 伪装参数配置 ====================
+static constexpr uint64_t FAKE_RAM_TOTAL_GB = 4ULL; // 总 RAM 改为 4GB
+static constexpr uint64_t RAM_MULTIPLIER = 2ULL;     // 可用内存放大 2 倍
+static constexpr uint64_t FAKE_RAM_TOTAL_KB = FAKE_RAM_TOTAL_GB * 1024ULL * 1024ULL;
+static constexpr uint64_t FAKE_RAM_TOTAL_BYTES = FAKE_RAM_TOTAL_GB * 1024ULL * 1024ULL * 1024ULL;
 
 typedef void (*T_Callback)(void *, const char *, const char *, uint32_t);
 static std::map<void *, T_Callback> callbacks;
@@ -58,11 +68,9 @@ static inline bool is_user_storage_path(const char *path) {
 static int my_statvfs(const char *path, struct statvfs *buf) {
     int result = orig_statvfs(path, buf);
     if (result == 0 && buf != nullptr && spoofStorage && is_user_storage_path(path)) {
-        // 计算真实剩余块数的 6 倍
         uint64_t realFreeBlocks = buf->f_bfree;
         uint64_t fakeFreeBlocks = realFreeBlocks * 6ULL;
         
-        // 防超限处理：剩余块数不能超过总块数
         if (fakeFreeBlocks > fakeTotalBlocks) {
             fakeFreeBlocks = fakeTotalBlocks;
         }
@@ -79,11 +87,9 @@ static int my_statvfs(const char *path, struct statvfs *buf) {
 static int my_statfs(const char *path, struct statfs *buf) {
     int result = orig_statfs(path, buf);
     if (result == 0 && buf != nullptr && spoofStorage && is_user_storage_path(path)) {
-        // 计算真实剩余块数的 6 倍
         uint64_t realFreeBlocks = buf->f_bfree;
         uint64_t fakeFreeBlocks = realFreeBlocks * 6ULL;
 
-        // 防超限处理：剩余块数不能超过总块数
         if (fakeFreeBlocks > fakeTotalBlocks) {
             fakeFreeBlocks = fakeTotalBlocks;
         }
@@ -96,6 +102,89 @@ static int my_statfs(const char *path, struct statfs *buf) {
     return result;
 }
 
+// ==================== RAM 内存 Hook 核心逻辑 ====================
+
+// 1. sysinfo API Hook
+static int (*orig_sysinfo)(struct sysinfo *info) = nullptr;
+
+static int my_sysinfo(struct sysinfo *info) {
+    int res = orig_sysinfo(info);
+    if (res == 0 && info != nullptr) {
+        uint64_t unit = info->mem_unit ? info->mem_unit : 1;
+        
+        // 放大可用物理内存 (freeram)
+        uint64_t realFreeBytes = static_cast<uint64_t>(info->freeram) * unit;
+        uint64_t fakeFreeBytes = realFreeBytes * RAM_MULTIPLIER;
+        if (fakeFreeBytes > FAKE_RAM_TOTAL_BYTES) {
+            fakeFreeBytes = FAKE_RAM_TOTAL_BYTES;
+        }
+
+        // 放大缓冲内存 (bufferram)
+        uint64_t realBufferBytes = static_cast<uint64_t>(info->bufferram) * unit;
+        uint64_t fakeBufferBytes = realBufferBytes * RAM_MULTIPLIER;
+        if (fakeBufferBytes > FAKE_RAM_TOTAL_BYTES) {
+            fakeBufferBytes = FAKE_RAM_TOTAL_BYTES;
+        }
+
+        info->totalram  = static_cast<unsigned long>(FAKE_RAM_TOTAL_BYTES / unit);
+        info->freeram   = static_cast<unsigned long>(fakeFreeBytes / unit);
+        info->bufferram = static_cast<unsigned long>(fakeBufferBytes / unit);
+    }
+    return res;
+}
+
+// 2. /proc/meminfo 文件 Hook (openat / open 管道重定向)
+static int (*orig_openat)(int dirfd, const char *pathname, int flags, mode_t mode) = nullptr;
+
+static std::string generate_fake_meminfo() {
+    std::ifstream realMeminfo("/proc/meminfo");
+    if (!realMeminfo.is_open()) return "";
+
+    std::string line;
+    std::ostringstream newContent;
+
+    while (std::getline(realMeminfo, line)) {
+        if (line.rfind("MemTotal:", 0) == 0) {
+            newContent << "MemTotal:       " << FAKE_RAM_TOTAL_KB << " kB\n";
+        } 
+        else if (line.rfind("MemFree:", 0) == 0 || 
+                 line.rfind("MemAvailable:", 0) == 0 || 
+                 line.rfind("Buffers:", 0) == 0 || 
+                 line.rfind("Cached:", 0) == 0) {
+            
+            char key[64] = {0};
+            uint64_t realKb = 0;
+            sscanf(line.c_str(), "%63s %20lu", key, &realKb);
+
+            uint64_t fakeKb = realKb * RAM_MULTIPLIER;
+            if (fakeKb > FAKE_RAM_TOTAL_KB) fakeKb = FAKE_RAM_TOTAL_KB;
+
+            char buf[128];
+            snprintf(buf, sizeof(buf), "%-16s%8lu kB\n", key, fakeKb);
+            newContent << buf;
+        } 
+        else {
+            newContent << line << "\n";
+        }
+    }
+    return newContent.str();
+}
+
+static int my_openat(int dirfd, const char *pathname, int flags, mode_t mode) {
+    if (pathname != nullptr && strcmp(pathname, "/proc/meminfo") == 0) {
+        std::string fakeData = generate_fake_meminfo();
+        if (!fakeData.empty()) {
+            int pipefds[2];
+            if (pipe2(pipefds, O_CLOEXEC) == 0) {
+                write(pipefds[1], fakeData.c_str(), fakeData.size());
+                close(pipefds[1]); // 立即关闭写端，保证读端读取数据时不阻塞且立刻 EOF
+                return pipefds[0];  // 返回读端 fd
+            }
+        }
+    }
+    return orig_openat(dirfd, pathname, flags, mode);
+}
+
 static void doHook() {
     void *handle = DobbySymbolResolver(nullptr, "__system_property_read_callback");
     if (handle != nullptr) {
@@ -103,6 +192,7 @@ static void doHook() {
                   reinterpret_cast<dobby_dummy_func_t *>(&o_system_property_read_callback));
     }
 
+    // Hook 存储空间 API
     if (spoofStorage) {
         void* statvfs_ptr = DobbySymbolResolver(nullptr, "statvfs");
         if (!statvfs_ptr) statvfs_ptr = DobbySymbolResolver(nullptr, "statvfs64");
@@ -117,6 +207,19 @@ static void doHook() {
             DobbyHook(statfs_ptr, reinterpret_cast<dobby_dummy_func_t>(my_statfs),
                       reinterpret_cast<dobby_dummy_func_t*>(&orig_statfs));
         }
+    }
+
+    // Hook RAM 内存 API
+    void* sysinfo_ptr = DobbySymbolResolver(nullptr, "sysinfo");
+    if (sysinfo_ptr) {
+        DobbyHook(sysinfo_ptr, reinterpret_cast<dobby_dummy_func_t>(my_sysinfo),
+                  reinterpret_cast<dobby_dummy_func_t*>(&orig_sysinfo));
+    }
+
+    void* openat_ptr = DobbySymbolResolver(nullptr, "openat");
+    if (openat_ptr) {
+        DobbyHook(openat_ptr, reinterpret_cast<dobby_dummy_func_t>(my_openat),
+                  reinterpret_cast<dobby_dummy_func_t*>(&orig_openat));
     }
 }
 
@@ -157,7 +260,6 @@ public:
     }
 
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
-        // 关键防护：如果 app_data_dir 为空，说明不是标准的 APK/应用进程，直接跳过注入！
         if (args == nullptr || args->app_data_dir == nullptr || args->nice_name == nullptr) {
             api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
             return;
@@ -204,13 +306,12 @@ public:
         if (dexVector.empty()) return;
 
         doHook();
-        inject(); // 只有纯正的 APK 进程才会加载并执行 DEX 注入
+        inject();
 
         dexVector.clear();
     }
 
     void preServerSpecialize(zygisk::ServerSpecializeArgs *args) override {
-        // system_server 只做底层 C 函数 Hook，绝不调用 inject() 注入 DEX
         doHook();
     }
 
