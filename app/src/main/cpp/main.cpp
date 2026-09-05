@@ -12,6 +12,7 @@
 #include <sys/vfs.h>
 #include <sys/sysinfo.h>
 #include <fcntl.h>
+#include <sys/mman.h>
 
 #include "zygisk.hpp"
 #include "json/single_include/nlohmann/json.hpp"
@@ -28,9 +29,8 @@ static const uint64_t FAKE_BLOCK_SIZE = 4096;
 static fsblkcnt_t fakeTotalBlocks = (FAKE_TOTAL_GB * 1024ULL * 1024ULL * 1024ULL) / FAKE_BLOCK_SIZE;
 
 // ==================== 内存 (RAM) 伪装参数配置 ====================
-static constexpr uint64_t FAKE_RAM_TOTAL_GB = 4ULL; // 总 RAM 改为 4GB
-static constexpr uint64_t RAM_MULTIPLIER = 2ULL;     // 可用内存放大 2 倍
-static constexpr uint64_t FAKE_RAM_TOTAL_KB = FAKE_RAM_TOTAL_GB * 1024ULL * 1024ULL;
+static constexpr uint64_t FAKE_RAM_TOTAL_GB = 4ULL; // 总 RAM 固定为 4GB
+static constexpr uint64_t FAKE_RAM_TOTAL_KB = FAKE_RAM_TOTAL_GB * 1024ULL * 1024ULL; // 4194304 kB
 static constexpr uint64_t FAKE_RAM_TOTAL_BYTES = FAKE_RAM_TOTAL_GB * 1024ULL * 1024ULL * 1024ULL;
 
 typedef void (*T_Callback)(void *, const char *, const char *, uint32_t);
@@ -111,58 +111,100 @@ static int my_sysinfo(struct sysinfo *info) {
     if (res == 0 && info != nullptr) {
         uint64_t unit = info->mem_unit ? info->mem_unit : 1;
         
-        // 放大可用物理内存 (freeram)
-        uint64_t realFreeBytes = static_cast<uint64_t>(info->freeram) * unit;
-        uint64_t fakeFreeBytes = realFreeBytes * RAM_MULTIPLIER;
-        if (fakeFreeBytes > FAKE_RAM_TOTAL_BYTES) {
-            fakeFreeBytes = FAKE_RAM_TOTAL_BYTES;
-        }
+        // 按照已用内存 x2 换算
+        unsigned long long real_total = info->totalram * unit;
+        unsigned long long real_free = info->freeram * unit;
+        unsigned long long real_used = (real_total > real_free) ? (real_total - real_free) : real_free;
+        
+        unsigned long long fake_used = real_used * 2ULL;
+        unsigned long long fake_total = FAKE_RAM_TOTAL_BYTES;
+        if (fake_used >= fake_total) fake_used = fake_total - (512ULL * 1024ULL * 1024ULL);
+        unsigned long long fake_free = fake_total - fake_used;
 
-        // 放大缓冲内存 (bufferram)
-        uint64_t realBufferBytes = static_cast<uint64_t>(info->bufferram) * unit;
-        uint64_t fakeBufferBytes = realBufferBytes * RAM_MULTIPLIER;
-        if (fakeBufferBytes > FAKE_RAM_TOTAL_BYTES) {
-            fakeBufferBytes = FAKE_RAM_TOTAL_BYTES;
-        }
-
-        info->totalram  = static_cast<unsigned long>(FAKE_RAM_TOTAL_BYTES / unit);
-        info->freeram   = static_cast<unsigned long>(fakeFreeBytes / unit);
-        info->bufferram = static_cast<unsigned long>(fakeBufferBytes / unit);
+        info->totalram  = static_cast<unsigned long>(fake_total / unit);
+        info->freeram   = static_cast<unsigned long>(fake_free / unit);
+        info->bufferram = static_cast<unsigned long>((info->bufferram * 2ULL));
     }
     return res;
 }
 
-// 2. /proc/meminfo 文件 Hook (纯 C FILE* 解析，无 C++ iostream 依赖)
-static int (*orig_openat)(int dirfd, const char *pathname, int flags, mode_t mode) = nullptr;
-
+// 2. /proc/meminfo 文件 Hook (基于 memfd_create 完美换算)
 static std::string generate_fake_meminfo() {
     FILE *fp = fopen("/proc/meminfo", "r");
     if (!fp) return "";
 
     char line[256];
+    std::map<std::string, unsigned long long> memMap;
+
+    // 解析真实 meminfo
+    while (fgets(line, sizeof(line), fp)) {
+        char key[64] = {0};
+        unsigned long long val = 0;
+        if (sscanf(line, "%63s %20llu", key, &val) == 2) {
+            size_t len = strlen(key);
+            if (len > 0 && key[len - 1] == ':') {
+                key[len - 1] = '\0';
+            }
+            memMap[key] = val;
+        }
+    }
+    fclose(fp);
+
+    // 获取真实基准数据
+    unsigned long long r_total = memMap.count("MemTotal") ? memMap["MemTotal"] : 2055168ULL;
+    unsigned long long r_free = memMap.count("MemFree") ? memMap["MemFree"] : 494076ULL;
+    unsigned long long r_avail = memMap.count("MemAvailable") ? memMap["MemAvailable"] : 1087320ULL;
+    unsigned long long r_buffers = memMap.count("Buffers") ? memMap["Buffers"] : 7676ULL;
+    unsigned long long r_cached = memMap.count("Cached") ? memMap["Cached"] : 718756ULL;
+
+    // 规则实现：已用内存 = 总内存 - 可用内存，然后放大 2 倍
+    unsigned long long r_used = (r_total > r_avail) ? (r_total - r_avail) : (r_total - r_free);
+    unsigned long long f_used = r_used * 2ULL;
+    unsigned long long f_total = FAKE_RAM_TOTAL_KB; // 4GB
+
+    if (f_used >= f_total) {
+        f_used = f_total - 512ULL * 1024ULL; // 至少留出 512MB
+    }
+
+    // 可用内存自动换算
+    unsigned long long f_avail = f_total - f_used;
+    double scale = (r_avail > 0) ? ((double)f_avail / (double)r_avail) : 1.0;
+    
+    unsigned long long f_free = (unsigned long long)(r_free * scale);
+    unsigned long long f_buffers = (unsigned long long)(r_buffers * scale);
+    unsigned long long f_cached = (unsigned long long)(r_cached * scale);
+
+    // 重新组合输出
+    fp = fopen("/proc/meminfo", "r");
+    if (!fp) return "";
+
     std::string newContent;
     newContent.reserve(4096);
 
     while (fgets(line, sizeof(line), fp)) {
         if (strncmp(line, "MemTotal:", 9) == 0) {
             char buf[128];
-            snprintf(buf, sizeof(buf), "MemTotal:       %8llu kB\n", (unsigned long long)FAKE_RAM_TOTAL_KB);
+            snprintf(buf, sizeof(buf), "MemTotal:       %8llu kB\n", f_total);
             newContent += buf;
         } 
-        else if (strncmp(line, "MemFree:", 8) == 0 || 
-                 strncmp(line, "MemAvailable:", 13) == 0 || 
-                 strncmp(line, "Buffers:", 8) == 0 || 
-                 strncmp(line, "Cached:", 7) == 0) {
-            
-            char key[64] = {0};
-            unsigned long long realKb = 0;
-            sscanf(line, "%63s %20llu", key, &realKb);
-
-            unsigned long long fakeKb = realKb * RAM_MULTIPLIER;
-            if (fakeKb > FAKE_RAM_TOTAL_KB) fakeKb = FAKE_RAM_TOTAL_KB;
-
+        else if (strncmp(line, "MemFree:", 8) == 0) {
             char buf[128];
-            snprintf(buf, sizeof(buf), "%-16s%8llu kB\n", key, fakeKb);
+            snprintf(buf, sizeof(buf), "MemFree:        %8llu kB\n", f_free);
+            newContent += buf;
+        } 
+        else if (strncmp(line, "MemAvailable:", 13) == 0) {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "MemAvailable:   %8llu kB\n", f_avail);
+            newContent += buf;
+        } 
+        else if (strncmp(line, "Buffers:", 8) == 0) {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "Buffers:        %8llu kB\n", f_buffers);
+            newContent += buf;
+        } 
+        else if (strncmp(line, "Cached:", 7) == 0) {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "Cached:         %8llu kB\n", f_cached);
             newContent += buf;
         } 
         else {
@@ -173,19 +215,35 @@ static std::string generate_fake_meminfo() {
     return newContent;
 }
 
+// 核心改进：用 memfd_create 创建内存文件描述符，完美支持 lseek 和 read
+static int create_fake_meminfo_fd() {
+    std::string fakeData = generate_fake_meminfo();
+    if (fakeData.empty()) return -1;
+
+    int memfd = memfd_create("meminfo", MFD_CLOEXEC);
+    if (memfd < 0) return -1;
+
+    write(memfd, fakeData.c_str(), fakeData.size());
+    lseek(memfd, 0, SEEK_SET); // 指针复位到开头，供 App 读取
+    return memfd;
+}
+
+static int (*orig_openat)(int dirfd, const char *pathname, int flags, mode_t mode) = nullptr;
 static int my_openat(int dirfd, const char *pathname, int flags, mode_t mode) {
     if (pathname != nullptr && strcmp(pathname, "/proc/meminfo") == 0) {
-        std::string fakeData = generate_fake_meminfo();
-        if (!fakeData.empty()) {
-            int pipefds[2];
-            if (pipe2(pipefds, O_CLOEXEC) == 0) {
-                write(pipefds[1], fakeData.c_str(), fakeData.size());
-                close(pipefds[1]); // 关闭写端，读端可读且达到 EOF 时即结束
-                return pipefds[0];  // 返回管道读端文件描述符
-            }
-        }
+        int fake_fd = create_fake_meminfo_fd();
+        if (fake_fd >= 0) return fake_fd;
     }
     return orig_openat(dirfd, pathname, flags, mode);
+}
+
+static int (*orig_open)(const char *pathname, int flags, mode_t mode) = nullptr;
+static int my_open(const char *pathname, int flags, mode_t mode) {
+    if (pathname != nullptr && strcmp(pathname, "/proc/meminfo") == 0) {
+        int fake_fd = create_fake_meminfo_fd();
+        if (fake_fd >= 0) return fake_fd;
+    }
+    return orig_open(pathname, flags, mode);
 }
 
 static void doHook() {
@@ -195,7 +253,6 @@ static void doHook() {
                   reinterpret_cast<dobby_dummy_func_t *>(&o_system_property_read_callback));
     }
 
-    // Hook 存储空间 API
     if (spoofStorage) {
         void* statvfs_ptr = DobbySymbolResolver(nullptr, "statvfs");
         if (!statvfs_ptr) statvfs_ptr = DobbySymbolResolver(nullptr, "statvfs64");
@@ -212,7 +269,6 @@ static void doHook() {
         }
     }
 
-    // Hook RAM 内存 API
     void* sysinfo_ptr = DobbySymbolResolver(nullptr, "sysinfo");
     if (sysinfo_ptr) {
         DobbyHook(sysinfo_ptr, reinterpret_cast<dobby_dummy_func_t>(my_sysinfo),
@@ -223,6 +279,12 @@ static void doHook() {
     if (openat_ptr) {
         DobbyHook(openat_ptr, reinterpret_cast<dobby_dummy_func_t>(my_openat),
                   reinterpret_cast<dobby_dummy_func_t*>(&orig_openat));
+    }
+
+    void* open_ptr = DobbySymbolResolver(nullptr, "open");
+    if (open_ptr) {
+        DobbyHook(open_ptr, reinterpret_cast<dobby_dummy_func_t>(my_open),
+                  reinterpret_cast<dobby_dummy_func_t*>(&orig_open));
     }
 }
 
