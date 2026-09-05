@@ -15,22 +15,18 @@
 #include "dobby.h"
 
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, "TFIX/Native", __VA_ARGS__)
-
 #define DEX_FILE_PATH "/data/adb/modules/targetedfix/classes.dex"
 
-// ==================== 在这里直接硬编码你的存储空间伪装参数 ====================
-// 如果不想伪装存储空间，可以把 FAKE_TOTAL_GB 改为 0
-static constexpr uint64_t FAKE_TOTAL_GB = 512; // 伪装总容量为 512 GB
-static constexpr uint64_t FAKE_FREE_GB  = 256; // 伪装剩余容量为 256 GB
-// ============================================================================
+// 硬编码伪装容量参数：512GB 总空间，256GB 剩余空间
+static constexpr uint64_t FAKE_TOTAL_GB = 512; 
+static constexpr uint64_t FAKE_FREE_GB  = 256;
 
 static bool spoofStorage = (FAKE_TOTAL_GB > 0);
-static const uint64_t FAKE_BLOCK_SIZE = 4096; // 4KB 逻辑块大小
+static const uint64_t FAKE_BLOCK_SIZE = 4096;
 static fsblkcnt_t fakeTotalBlocks = (FAKE_TOTAL_GB * 1024ULL * 1024ULL * 1024ULL) / FAKE_BLOCK_SIZE;
 static fsblkcnt_t fakeFreeBlocks  = (FAKE_FREE_GB * 1024ULL * 1024ULL * 1024ULL) / FAKE_BLOCK_SIZE;
 
 typedef void (*T_Callback)(void *, const char *, const char *, uint32_t);
-
 static std::map<void *, T_Callback> callbacks;
 
 static void modify_callback(void *cookie, const char *name, const char *value, uint32_t serial) {
@@ -48,7 +44,7 @@ static void my_system_property_read_callback(const prop_info *pi, T_Callback cal
     return o_system_property_read_callback(pi, modify_callback, cookie);
 }
 
-// ==================== statvfs / statfs Hook 逻辑 ====================
+// ==================== statvfs / statfs / 64位 全路线 Hook 逻辑 ====================
 static int (*orig_statvfs)(const char *path, struct statvfs *buf) = nullptr;
 static int (*orig_statfs)(const char *path, struct statfs *buf) = nullptr;
 
@@ -93,12 +89,14 @@ static void doHook() {
 
     if (spoofStorage) {
         void* statvfs_ptr = DobbySymbolResolver(nullptr, "statvfs");
+        if (!statvfs_ptr) statvfs_ptr = DobbySymbolResolver(nullptr, "statvfs64");
         if (statvfs_ptr) {
             DobbyHook(statvfs_ptr, reinterpret_cast<dobby_dummy_func_t>(my_statvfs),
                       reinterpret_cast<dobby_dummy_func_t*>(&orig_statvfs));
         }
 
         void* statfs_ptr = DobbySymbolResolver(nullptr, "statfs");
+        if (!statfs_ptr) statfs_ptr = DobbySymbolResolver(nullptr, "statfs64");
         if (statfs_ptr) {
             DobbyHook(statfs_ptr, reinterpret_cast<dobby_dummy_func_t>(my_statfs),
                       reinterpret_cast<dobby_dummy_func_t*>(&orig_statfs));
@@ -106,7 +104,7 @@ static void doHook() {
     }
 }
 
-static void setFieldNative(JNIEnv *env, jclass /* clazz_EntryPoint */, jclass targetClass, jobject fieldObj, jstring typeObj, jobject valueObj) {
+static void setFieldNative(JNIEnv *env, jclass, jclass targetClass, jobject fieldObj, jstring typeObj, jobject valueObj) {
     if (!targetClass || !fieldObj || !typeObj) return;
 
     jfieldID fieldID = env->FromReflectedField(fieldObj);
@@ -119,18 +117,15 @@ static void setFieldNative(JNIEnv *env, jclass /* clazz_EntryPoint */, jclass ta
     } else if (strcmp(typeName, "int") == 0) {
         jclass intClass = env->FindClass("java/lang/Integer");
         jmethodID intValue = env->GetMethodID(intClass, "intValue", "()I");
-        jint val = env->CallIntMethod(valueObj, intValue);
-        env->SetStaticIntField(targetClass, fieldID, val);
+        env->SetStaticIntField(targetClass, fieldID, env->CallIntMethod(valueObj, intValue));
     } else if (strcmp(typeName, "long") == 0) {
         jclass longClass = env->FindClass("java/lang/Long");
         jmethodID longValue = env->GetMethodID(longClass, "longValue", "()J");
-        jlong val = env->CallLongMethod(valueObj, longValue);
-        env->SetStaticLongField(targetClass, fieldID, val);
+        env->SetStaticLongField(targetClass, fieldID, env->CallLongMethod(valueObj, longValue));
     } else if (strcmp(typeName, "boolean") == 0) {
         jclass boolClass = env->FindClass("java/lang/Boolean");
         jmethodID booleanValue = env->GetMethodID(boolClass, "booleanValue", "()Z");
-        jboolean val = env->CallBooleanMethod(valueObj, booleanValue);
-        env->SetStaticBooleanField(targetClass, fieldID, val);
+        env->SetStaticBooleanField(targetClass, fieldID, env->CallBooleanMethod(valueObj, booleanValue));
     } else if (strcmp(typeName, "[Ljava.lang.String;") == 0) {
         env->SetStaticObjectField(targetClass, fieldID, valueObj);
     }
@@ -147,7 +142,6 @@ public:
 
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
         bool shouldSpoof = false;
-
         auto rawProcess = env->GetStringUTFChars(args->nice_name, nullptr);
         auto rawDir = env->GetStringUTFChars(args->app_data_dir, nullptr);
 
@@ -160,7 +154,7 @@ public:
 
         std::string processStr(rawProcess);
 
-        // 全局用户 App 过滤：放行所有第三方App及系统设置，排除核心底层系统进程
+        // 包含设置界面（com.android.settings）与核心进程拦截
         if (processStr != "android" && 
             processStr.find("android.process") == std::string::npos &&
             processStr.find("com.android.systemui") == std::string::npos) {
@@ -180,7 +174,6 @@ public:
         long dexSize = 0;
         int fd = api->connectCompanion();
 
-        // 仅传输包名给 Companion 读取 dex
         long processSize = processStr.size();
         write(fd, &processSize, sizeof(long));
         write(fd, processStr.data(), processSize);
@@ -189,14 +182,12 @@ public:
 
         if (dexSize < 1) {
             close(fd);
-            LOGD("Couldn't read dex file");
             api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
             return;
         }
 
         dexVector.resize(dexSize);
         read(fd, dexVector.data(), dexSize);
-
         close(fd);
     }
 
@@ -240,7 +231,6 @@ private:
         };
         env->RegisterNatives(entryClass, methods, 1);
 
-        // 初始化参数传 0 或默认值，因为去掉了配置文件
         auto entryInit = env->GetStaticMethodID(entryClass, "init", "(IIII)V");
         env->CallStaticVoidMethod(entryClass, entryInit, 0, 1, 0, 0);
 
@@ -280,5 +270,4 @@ static void companion(int fd) {
 }
 
 REGISTER_ZYGISK_MODULE(TargetedFix)
-
 REGISTER_ZYGISK_COMPANION(companion)
