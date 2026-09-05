@@ -141,7 +141,12 @@ public:
     }
 
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
-        bool shouldSpoof = false;
+        // 关键防护：如果 app_data_dir 为空，说明不是标准的 APK/应用进程，直接跳过注入！
+        if (args == nullptr || args->app_data_dir == nullptr || args->nice_name == nullptr) {
+            api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
+            return;
+        }
+
         auto rawProcess = env->GetStringUTFChars(args->nice_name, nullptr);
         auto rawDir = env->GetStringUTFChars(args->app_data_dir, nullptr);
 
@@ -154,20 +159,8 @@ public:
 
         std::string processStr(rawProcess);
 
-        // 包含设置界面（com.android.settings）与核心进程拦截
-        if (processStr != "android" && 
-            processStr.find("android.process") == std::string::npos &&
-            processStr.find("com.android.systemui") == std::string::npos) {
-            shouldSpoof = true; 
-        }
-
         env->ReleaseStringUTFChars(args->nice_name, rawProcess);
         env->ReleaseStringUTFChars(args->app_data_dir, rawDir);
-
-        if (!shouldSpoof) {
-            api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
-            return;
-        }
 
         api->setOption(zygisk::FORCE_DENYLIST_UNMOUNT);
 
@@ -195,13 +188,14 @@ public:
         if (dexVector.empty()) return;
 
         doHook();
-        inject();
+        inject(); // 只有纯正的 APK 进程才会加载并执行 DEX 注入
 
         dexVector.clear();
     }
 
     void preServerSpecialize(zygisk::ServerSpecializeArgs *args) override {
-        api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
+        // system_server 只做底层 C 函数 Hook，绝不调用 inject() 注入 DEX
+        doHook();
     }
 
 private:
