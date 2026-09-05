@@ -7,6 +7,8 @@
 #include <cctype>
 #include <map>
 #include <cstdio>
+#include <sys/statvfs.h>
+#include <sys/vfs.h>
 
 #include "zygisk.hpp"
 #include "json/single_include/nlohmann/json.hpp"
@@ -15,11 +17,8 @@
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, "TFIX/Native", __VA_ARGS__)
 
 #define DEX_FILE_PATH "/data/adb/modules/targetedfix/classes.dex"
-
 #define PROP_FILE_PATH "/data/adb/modules/targetedfix/config/fix.prop"
-
 #define JSON_FILE_PATH "/data/adb/modules/targetedfix/config/fix.json"
-
 #define TARGET_LIST_PATH "/data/adb/modules/targetedfix/config/target.txt"
 
 static int verboseLogs = 0;
@@ -27,6 +26,12 @@ static int spoofBuild = 1;
 static int spoofProps = 1;
 static int spoofProvider = 0;
 static int spoofSignature = 0;
+
+// ==================== 存储空间伪装全局变量 ====================
+static bool spoofStorage = false;
+static const uint64_t FAKE_BLOCK_SIZE = 4096; // 4KB 逻辑块大小
+static fsblkcnt_t fakeTotalBlocks = 0;
+static fsblkcnt_t fakeFreeBlocks = 0;
 
 static std::map<std::string, std::string> jsonProps;
 
@@ -38,7 +43,6 @@ static void modify_callback(void *cookie, const char *name, const char *value, u
     if (cookie == nullptr || name == nullptr || value == nullptr || !callbacks.contains(cookie)) return;
 
     const char *oldValue = value;
-	
     std::string prop(name);
 
     if (jsonProps.count(prop)) {
@@ -73,15 +77,69 @@ static void my_system_property_read_callback(const prop_info *pi, T_Callback cal
     return o_system_property_read_callback(pi, modify_callback, cookie);
 }
 
+// ==================== statvfs / statfs Hook 逻辑 ====================
+static int (*orig_statvfs)(const char *path, struct statvfs *buf) = nullptr;
+static int (*orig_statfs)(const char *path, struct statfs *buf) = nullptr;
+
+static inline bool is_user_storage_path(const char *path) {
+    if (!path) return false;
+    return (strncmp(path, "/data", 5) == 0 || 
+            strncmp(path, "/storage", 8) == 0 || 
+            strncmp(path, "/sdcard", 7) == 0);
+}
+
+static int my_statvfs(const char *path, struct statvfs *buf) {
+    int result = orig_statvfs(path, buf);
+    if (result == 0 && buf != nullptr && spoofStorage && is_user_storage_path(path)) {
+        buf->f_bsize   = FAKE_BLOCK_SIZE;
+        buf->f_frsize  = FAKE_BLOCK_SIZE;
+        buf->f_blocks  = fakeTotalBlocks;
+        buf->f_bfree   = fakeFreeBlocks;
+        buf->f_bavail  = fakeFreeBlocks;
+        if (verboseLogs > 0) LOGD("Hooked statvfs for path: %s", path);
+    }
+    return result;
+}
+
+static int my_statfs(const char *path, struct statfs *buf) {
+    int result = orig_statfs(path, buf);
+    if (result == 0 && buf != nullptr && spoofStorage && is_user_storage_path(path)) {
+        buf->f_bsize  = FAKE_BLOCK_SIZE;
+        buf->f_blocks = fakeTotalBlocks;
+        buf->f_bfree  = fakeFreeBlocks;
+        buf->f_bavail = fakeFreeBlocks;
+        if (verboseLogs > 0) LOGD("Hooked statfs for path: %s", path);
+    }
+    return result;
+}
+
 static void doHook() {
+    // 1. Hook __system_property_read_callback
     void *handle = DobbySymbolResolver(nullptr, "__system_property_read_callback");
     if (handle == nullptr) {
         LOGD("Couldn't find '__system_property_read_callback' handle");
-        return;
+    } else {
+        LOGD("Found '__system_property_read_callback' handle at %p", handle);
+        DobbyHook(handle, reinterpret_cast<dobby_dummy_func_t>(my_system_property_read_callback),
+                  reinterpret_cast<dobby_dummy_func_t *>(&o_system_property_read_callback));
     }
-    LOGD("Found '__system_property_read_callback' handle at %p", handle);
-    DobbyHook(handle, reinterpret_cast<dobby_dummy_func_t>(my_system_property_read_callback),
-        reinterpret_cast<dobby_dummy_func_t *>(&o_system_property_read_callback));
+
+    // 2. Hook statvfs 与 statfs 用于硬盘空间伪装
+    if (spoofStorage) {
+        void* statvfs_ptr = DobbySymbolResolver(nullptr, "statvfs");
+        if (statvfs_ptr) {
+            DobbyHook(statvfs_ptr, reinterpret_cast<dobby_dummy_func_t>(my_statvfs),
+                      reinterpret_cast<dobby_dummy_func_t*>(&orig_statvfs));
+            LOGD("Hooked statvfs at %p", statvfs_ptr);
+        }
+
+        void* statfs_ptr = DobbySymbolResolver(nullptr, "statfs");
+        if (statfs_ptr) {
+            DobbyHook(statfs_ptr, reinterpret_cast<dobby_dummy_func_t>(my_statfs),
+                      reinterpret_cast<dobby_dummy_func_t*>(&orig_statfs));
+            LOGD("Hooked statfs at %p", statfs_ptr);
+        }
+    }
 }
 
 static void setFieldNative(JNIEnv *env, jclass /* clazz_EntryPoint */, jclass targetClass, jobject fieldObj, jstring typeObj, jobject valueObj) {
@@ -109,7 +167,7 @@ static void setFieldNative(JNIEnv *env, jclass /* clazz_EntryPoint */, jclass ta
         jmethodID booleanValue = env->GetMethodID(boolClass, "booleanValue", "()Z");
         jboolean val = env->CallBooleanMethod(valueObj, booleanValue);
         env->SetStaticBooleanField(targetClass, fieldID, val);
-	} else if (strcmp(typeName, "[Ljava.lang.String;") == 0) {
+    } else if (strcmp(typeName, "[Ljava.lang.String;") == 0) {
         env->SetStaticObjectField(targetClass, fieldID, valueObj);
     }
 
@@ -125,11 +183,10 @@ public:
 
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
         bool shouldSpoof = false;
-		
+
         auto rawProcess = env->GetStringUTFChars(args->nice_name, nullptr);
         auto rawDir = env->GetStringUTFChars(args->app_data_dir, nullptr);
-        
-        // Prevent crash on apps with no data dir
+
         if (rawDir == nullptr) {
             env->ReleaseStringUTFChars(args->nice_name, rawProcess);
             api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
@@ -140,16 +197,14 @@ public:
         std::string_view process(rawProcess);
 
         long dexSize = 0, jsonSize = 0, targetSize = 0;
-		
+
         int fd = api->connectCompanion();
 
-        // Send package name to companion
         std::string processStr(process);
         long processSize = processStr.size();
         write(fd, &processSize, sizeof(long));
         write(fd, processStr.data(), processSize);
-        
-        // Read file sizes from companion
+
         read(fd, &dexSize, sizeof(long));
         read(fd, &jsonSize, sizeof(long));
         read(fd, &targetSize, sizeof(long));
@@ -169,7 +224,7 @@ public:
 
         targetVector.resize(targetSize);
         read(fd, targetVector.data(), targetSize);
-        
+
         close(fd);
 
         parseTargetVector();
@@ -185,15 +240,12 @@ public:
             api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
             return;
         }
-        
-        // We are in TargetPackage now, force unmount
+
         api->setOption(zygisk::FORCE_DENYLIST_UNMOUNT);
-        
-        // START: Prop-to-JSON Conversion Logic
+
         std::string configString(jsonVector.cbegin(), jsonVector.cend());
         jsonVector.clear();
 
-        // Check if the file content is NOT valid JSON
         if (!nlohmann::json::accept(configString, true)) {
             LOGD("Converting config from prop format to JSON format");
 
@@ -222,7 +274,6 @@ public:
                     size_t lastPos = value.find_last_not_of(" ");
                     if (lastPos != std::string::npos) value.resize(lastPos + 1);
                 }
-                // Include all name=value pairs, even if value is empty (used as "delete"/clear command)
                 if (!name.empty()) {
                     jsonString += "\n\"" + name + "\": \"" + value + "\",";
                 }
@@ -230,12 +281,11 @@ public:
             if (jsonString.back() == ',') jsonString.pop_back();
             jsonString += "\n}\n";
 
-            configString = jsonString; // Update the string to the converted JSON
+            configString = jsonString;
         }
-        // END: Prop-to-JSON Conversion Logic
 
         json = nlohmann::json::parse(configString, nullptr, false, true);
-        configString.clear(); // Clear temporary string
+        configString.clear();
     }
 
     void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
@@ -243,7 +293,7 @@ public:
 
         readJson();
 
-        if (spoofProps > 0) doHook();
+        if (spoofProps > 0 || spoofStorage) doHook();
         if (spoofBuild + spoofProvider + spoofSignature > 0) inject();
 
         dexVector.clear();
@@ -264,7 +314,7 @@ private:
     std::vector<char> targetVector;
     nlohmann::json json;
     std::string pkgName;
-	std::vector<std::string> targetPackages;
+    std::vector<std::string> targetPackages;
 
     void parseTargetVector() {
         if (targetVector.empty()) return;
@@ -273,7 +323,6 @@ private:
         size_t totalSize = targetVector.size();
 
         for (size_t i = 0; i <= totalSize; ++i) {
-            // Detect newline or end of vector
             if (i == totalSize || targetVector[i] == '\n') {
                 processLineFromVector(start, i);
                 start = i + 1;
@@ -284,18 +333,14 @@ private:
     void processLineFromVector(size_t lineStart, size_t lineEnd) {
         size_t start = lineStart;
 
-        // 1. Skip leading whitespace and explicit \r
         while (start < lineEnd && (std::isspace((unsigned char)targetVector[start]) || targetVector[start] == '\r')) {
             start++;
         }
 
-        // Empty or comment line
         if (start >= lineEnd || targetVector[start] == '#') return;
 
         size_t end = lineEnd;
 
-        // 2. Explicitly skip trailing whitespace and \r
-        // This is the most important part for CRLF files
         while (end > start && (std::isspace((unsigned char)targetVector[end - 1]) || targetVector[end - 1] == '\r')) {
             end--;
         }
@@ -304,7 +349,7 @@ private:
             targetPackages.emplace_back(targetVector.data() + start, end - start);
         }
     }
-    
+
     bool isTargetPackage(std::string_view process) {
         std::string processStr(process);
         for (const auto &pkg : targetPackages) {
@@ -317,79 +362,78 @@ private:
 
     void readJson() {
         LOGD("JSON contains %d keys!", static_cast<int>(json.size()));
-        
-        // Verbose logging level
+
         if (json.contains("verboseLogs")) {
             if (!json["verboseLogs"].is_null() && json["verboseLogs"].is_string() && json["verboseLogs"] != "") {
                 verboseLogs = stoi(json["verboseLogs"].get<std::string>());
                 if (verboseLogs > 0) LOGD("Verbose logging (level %d) enabled!", verboseLogs);
-            } else {
-                LOGD("Error parsing verboseLogs!");
             }
             json.erase("verboseLogs");
         }
-        
-        // Advanced spoofing settings
+
         if (json.contains("spoofBuild")) {
             if (!json["spoofBuild"].is_null() && json["spoofBuild"].is_string() && json["spoofBuild"] != "") {
                 spoofBuild = stoi(json["spoofBuild"].get<std::string>());
-                if (verboseLogs > 0) LOGD("Spoofing Build Fields %s!", (spoofBuild > 0) ? "enabled" : "disabled");
-            } else {
-                LOGD("Error parsing spoofBuild!");
             }
             json.erase("spoofBuild");
         }
         if (json.contains("spoofProps")) {
             if (!json["spoofProps"].is_null() && json["spoofProps"].is_string() && json["spoofProps"] != "") {
                 spoofProps = stoi(json["spoofProps"].get<std::string>());
-                if (verboseLogs > 0) LOGD("Spoofing System Properties %s!", (spoofProps > 0) ? "enabled" : "disabled");
-            } else {
-                LOGD("Error parsing spoofProps!");
             }
             json.erase("spoofProps");
         }
         if (json.contains("spoofProvider")) {
             if (!json["spoofProvider"].is_null() && json["spoofProvider"].is_string() && json["spoofProvider"] != "") {
                 spoofProvider = stoi(json["spoofProvider"].get<std::string>());
-                if (verboseLogs > 0) LOGD("Spoofing Keystore Provider %s!", (spoofProvider > 0) ? "enabled" : "disabled");
-            } else {
-                LOGD("Error parsing spoofProvider!");
             }
             json.erase("spoofProvider");
         }
         if (json.contains("spoofSignature")) {
             if (!json["spoofSignature"].is_null() && json["spoofSignature"].is_string() && json["spoofSignature"] != "") {
                 spoofSignature = stoi(json["spoofSignature"].get<std::string>());
-                if (verboseLogs > 0) LOGD("Spoofing ROM Signature %s!", (spoofSignature > 0) ? "enabled" : "disabled");
-            } else {
-                LOGD("Error parsing spoofSignature!");
             }
             json.erase("spoofSignature");
+        }
+
+        // ==================== 解析 FAKE_TOTAL_GB 与 FAKE_FREE_GB ====================
+        uint64_t totalGb = 0, freeGb = 0;
+        if (json.contains("FAKE_TOTAL_GB")) {
+            if (!json["FAKE_TOTAL_GB"].is_null() && json["FAKE_TOTAL_GB"].is_string() && json["FAKE_TOTAL_GB"] != "") {
+                totalGb = std::stoull(json["FAKE_TOTAL_GB"].get<std::string>());
+            }
+            json.erase("FAKE_TOTAL_GB");
+        }
+        if (json.contains("FAKE_FREE_GB")) {
+            if (!json["FAKE_FREE_GB"].is_null() && json["FAKE_FREE_GB"].is_string() && json["FAKE_FREE_GB"] != "") {
+                freeGb = std::stoull(json["FAKE_FREE_GB"].get<std::string>());
+            }
+            json.erase("FAKE_FREE_GB");
+        }
+
+        if (totalGb > 0 && freeGb > 0) {
+            uint64_t totalBytes = totalGb * 1024ULL * 1024ULL * 1024ULL;
+            uint64_t freeBytes  = freeGb  * 1024ULL * 1024ULL * 1024ULL;
+            fakeTotalBlocks = totalBytes / FAKE_BLOCK_SIZE;
+            fakeFreeBlocks  = freeBytes / FAKE_BLOCK_SIZE;
+            spoofStorage = true;
+            LOGD("Storage Spoofing enabled: Total %LLU GB, Free %LLU GB", totalGb, freeGb);
         }
 
         std::vector<std::string> eraseKeys;
         for (auto &jsonList: json.items()) {
             if (verboseLogs > 1) LOGD("Parsing %s", jsonList.key().c_str());
             if (jsonList.key().find_first_of("*.") != std::string::npos) {
-                // Name contains . or * (wildcard) so assume real property name
                 if (!jsonList.value().is_null() && jsonList.value().is_string()) {
-                    // LOGIC: Check for empty string to signal clear/delete command
                     if (jsonList.value() == "") {
-                        if (verboseLogs > 0) LOGD("Adding '%s' to properties list as clear command (value: \"\")", jsonList.key().c_str());
-                        // Store the empty string as the clear marker
                         jsonProps[jsonList.key()] = "";
                     } else {
-                        if (verboseLogs > 0) LOGD("Adding '%s' to properties list", jsonList.key().c_str());
-                        // Store the new value
                         jsonProps[jsonList.key()] = jsonList.value();
                     }
-                } else {
-                    LOGD("Error parsing %s!", jsonList.key().c_str());
                 }
                 eraseKeys.push_back(jsonList.key());
             }
         }
-        // Remove properties from parsed JSON
         for (auto key: eraseKeys) {
             if (json.contains(key)) json.erase(key);
         }
@@ -414,10 +458,10 @@ private:
         const char* className = "es.chiteroman.playintegrityfix.EntryPoint";
         auto entryClassName = env->NewStringUTF(className);
         auto entryClassObj = env->CallObjectMethod(dexCl, loadClass, entryClassName);
-		
+
         auto entryClass = (jclass) entryClassObj;
-		
-		JNINativeMethod methods[] = {
+
+        JNINativeMethod methods[] = {
             {"setFieldNative", "(Ljava/lang/Class;Ljava/lang/reflect/Field;Ljava/lang/String;Ljava/lang/Object;)V", (void*) setFieldNative}
         };
         env->RegisterNatives(entryClass, methods, 1);
@@ -429,8 +473,12 @@ private:
 
         LOGD("JNI %s: Calling EntryPoint.init", niceName);
         auto entryInit = env->GetStaticMethodID(entryClass, "init", "(IIII)V");
-        env->CallStaticVoidMethod(entryClass, entryInit, verboseLogs, spoofBuild, spoofProvider, spoofSignature);
-		
+        auto javaVerbose = verboseLogs;
+        auto javaBuild = spoofBuild;
+        auto javaProvider = spoofProvider;
+        auto javaSignature = spoofSignature;
+        env->CallStaticVoidMethod(entryClass, entryInit, javaVerbose, javaBuild, javaProvider, javaSignature);
+
         env->DeleteLocalRef(javaStr);
         env->DeleteLocalRef(clClass);
         env->DeleteLocalRef(dexClClass);
@@ -445,49 +493,41 @@ private:
 static void companion(int fd) {
     long dexSize = 0, jsonSize = 0, targetSize = 0;
     std::vector<char> dexVector, jsonVector, targetVector;
-    
-    // Receive package name to enable per-app JSON
+
     std::string processName;
     long processSize = 0;
     read(fd, &processSize, sizeof(long));
     processName.resize(processSize);
     read(fd, processName.data(), processSize);
 
-    // Replace ':' with '.' for subprocess filename consistency
     std::replace(processName.begin(), processName.end(), ':', '.');
 
-    // --- File Reading Logic ---
     FILE *dex = fopen(DEX_FILE_PATH, "rb");
-	
     if (dex) {
         fseek(dex, 0, SEEK_END);
         dexSize = ftell(dex);
         fseek(dex, 0, SEEK_SET);
-		
+
         dexVector.resize(dexSize);
         fread(dexVector.data(), 1, dexSize, dex);
-		
+
         fclose(dex);
     }
 
     FILE *json = nullptr;
-    
-    // 1. Try per-app .prop file (e.g., com.example.app.prop)
+
     std::string customPropPath = "/data/adb/modules/targetedfix/config/" + processName + ".prop";
     json = fopen(customPropPath.c_str(), "r");
 
-    // 2. Fallback to per-app .json file (e.g., com.example.app.json)
     if (!json) {
         std::string customJsonPath = "/data/adb/modules/targetedfix/config/" + processName + ".json";
         json = fopen(customJsonPath.c_str(), "r");
     }
 
-    // 3. Fallback to standard fix.prop file
     if (!json) {
         json = fopen(PROP_FILE_PATH, "r");
     }
-    
-    // 4. Fallback to standard fix.json file
+
     if (!json) {
         json = fopen(JSON_FILE_PATH, "r");
     }
@@ -496,10 +536,10 @@ static void companion(int fd) {
         fseek(json, 0, SEEK_END);
         jsonSize = ftell(json);
         fseek(json, 0, SEEK_SET);
-		
+
         jsonVector.resize(jsonSize);
         fread(jsonVector.data(), 1, jsonSize, json);
-		
+
         fclose(json);
     }
 
@@ -508,10 +548,10 @@ static void companion(int fd) {
         fseek(target, 0, SEEK_END);
         targetSize = ftell(target);
         fseek(target, 0, SEEK_SET);
-		
+
         targetVector.resize(targetSize);
         fread(targetVector.data(), 1, targetSize, target);
-		
+
         fclose(target);
     }
 
