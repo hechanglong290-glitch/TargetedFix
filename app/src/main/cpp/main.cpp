@@ -6,11 +6,11 @@
 #include <algorithm>
 #include <cctype>
 #include <map>
+#include <mutex>
 #include <cstdio>
 #include <cstring>
 #include <sys/statvfs.h>
 #include <sys/vfs.h>
-#include <sys/sysinfo.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -42,14 +42,23 @@ static fsblkcnt_t fakeTotalBlocks = (FAKE_TOTAL_GB * 1024ULL * 1024ULL * 1024ULL
 // ==================== 内存 (RAM) 伪装参数配置 ====================
 static constexpr uint64_t FAKE_RAM_TOTAL_GB = 4ULL; // 总 RAM 固定为 4GB
 static constexpr uint64_t FAKE_RAM_TOTAL_KB = FAKE_RAM_TOTAL_GB * 1024ULL * 1024ULL; // 4194304 kB
-static constexpr uint64_t FAKE_RAM_TOTAL_BYTES = FAKE_RAM_TOTAL_GB * 1024ULL * 1024ULL * 1024ULL;
 
 typedef void (*T_Callback)(void *, const char *, const char *, uint32_t);
 static std::map<void *, T_Callback> callbacks;
+static std::mutex callbacks_mutex;
 
 static void modify_callback(void *cookie, const char *name, const char *value, uint32_t serial) {
-    if (cookie == nullptr || name == nullptr || value == nullptr || !callbacks.contains(cookie)) return;
-    return callbacks[cookie](cookie, name, value, serial);
+    if (cookie == nullptr || name == nullptr || value == nullptr) return;
+    T_Callback cb = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(callbacks_mutex);
+        if (callbacks.contains(cookie)) {
+            cb = callbacks[cookie];
+        }
+    }
+    if (cb) {
+        cb(cookie, name, value, serial);
+    }
 }
 
 static void (*o_system_property_read_callback)(const prop_info *, T_Callback, void *);
@@ -58,7 +67,10 @@ static void my_system_property_read_callback(const prop_info *pi, T_Callback cal
     if (pi == nullptr || callback == nullptr || cookie == nullptr) {
         return o_system_property_read_callback(pi, callback, cookie);
     }
-    callbacks[cookie] = callback;
+    {
+        std::lock_guard<std::mutex> lock(callbacks_mutex);
+        callbacks[cookie] = callback;
+    }
     return o_system_property_read_callback(pi, modify_callback, cookie);
 }
 
@@ -112,41 +124,18 @@ static int my_statfs(const char *path, struct statfs *buf) {
     return result;
 }
 
-// ==================== RAM 内存 Hook 核心逻辑 ====================
-
-// 1. sysinfo API Hook
-static int (*orig_sysinfo)(struct sysinfo *info) = nullptr;
-
-static int my_sysinfo(struct sysinfo *info) {
-    int res = orig_sysinfo(info);
-    if (res == 0 && info != nullptr) {
-        uint64_t unit = info->mem_unit ? info->mem_unit : 1;
-        
-        unsigned long long real_total = info->totalram * unit;
-        unsigned long long real_free = info->freeram * unit;
-        unsigned long long real_used = (real_total > real_free) ? (real_total - real_free) : real_free;
-        
-        unsigned long long fake_used = real_used * 2ULL;
-        unsigned long long fake_total = FAKE_RAM_TOTAL_BYTES;
-        if (fake_used >= fake_total) fake_used = fake_total - (512ULL * 1024ULL * 1024ULL);
-        unsigned long long fake_free = fake_total - fake_used;
-
-        info->totalram  = static_cast<unsigned long>(fake_total / unit);
-        info->freeram   = static_cast<unsigned long>(fake_free / unit);
-        info->bufferram = static_cast<unsigned long>((info->bufferram * 2ULL));
-    }
-    return res;
-}
-
-// 2. /proc/meminfo 文件 Hook
+// ==================== /proc/meminfo 内存 Hook 核心逻辑 ====================
 static std::string generate_fake_meminfo() {
     FILE *fp = fopen("/proc/meminfo", "r");
     if (!fp) return "";
 
     char line[256];
     std::map<std::string, unsigned long long> memMap;
+    std::vector<std::string> lines;
+    lines.reserve(64);
 
     while (fgets(line, sizeof(line), fp)) {
+        lines.emplace_back(line);
         char key[64] = {0};
         unsigned long long val = 0;
         if (sscanf(line, "%63s %20llu", key, &val) == 2) {
@@ -180,43 +169,39 @@ static std::string generate_fake_meminfo() {
     unsigned long long f_buffers = (unsigned long long)(r_buffers * scale);
     unsigned long long f_cached = (unsigned long long)(r_cached * scale);
 
-    fp = fopen("/proc/meminfo", "r");
-    if (!fp) return "";
-
     std::string newContent;
     newContent.reserve(4096);
 
-    while (fgets(line, sizeof(line), fp)) {
-        if (strncmp(line, "MemTotal:", 9) == 0) {
+    for (const auto &l : lines) {
+        if (l.starts_with("MemTotal:")) {
             char buf[128];
             snprintf(buf, sizeof(buf), "MemTotal:       %8llu kB\n", f_total);
             newContent += buf;
         } 
-        else if (strncmp(line, "MemFree:", 8) == 0) {
+        else if (l.starts_with("MemFree:")) {
             char buf[128];
             snprintf(buf, sizeof(buf), "MemFree:        %8llu kB\n", f_free);
             newContent += buf;
         } 
-        else if (strncmp(line, "MemAvailable:", 13) == 0) {
+        else if (l.starts_with("MemAvailable:")) {
             char buf[128];
             snprintf(buf, sizeof(buf), "MemAvailable:   %8llu kB\n", f_avail);
             newContent += buf;
         } 
-        else if (strncmp(line, "Buffers:", 8) == 0) {
+        else if (l.starts_with("Buffers:")) {
             char buf[128];
             snprintf(buf, sizeof(buf), "Buffers:        %8llu kB\n", f_buffers);
             newContent += buf;
         } 
-        else if (strncmp(line, "Cached:", 7) == 0) {
+        else if (l.starts_with("Cached:")) {
             char buf[128];
             snprintf(buf, sizeof(buf), "Cached:         %8llu kB\n", f_cached);
             newContent += buf;
         } 
         else {
-            newContent += line;
+            newContent += l;
         }
     }
-    fclose(fp);
     return newContent;
 }
 
@@ -271,12 +256,6 @@ static void doHook() {
             DobbyHook(statfs_ptr, reinterpret_cast<dobby_dummy_func_t>(my_statfs),
                       reinterpret_cast<dobby_dummy_func_t*>(&orig_statfs));
         }
-    }
-
-    void* sysinfo_ptr = DobbySymbolResolver(nullptr, "sysinfo");
-    if (sysinfo_ptr) {
-        DobbyHook(sysinfo_ptr, reinterpret_cast<dobby_dummy_func_t>(my_sysinfo),
-                  reinterpret_cast<dobby_dummy_func_t*>(&orig_sysinfo));
     }
 
     void* openat_ptr = DobbySymbolResolver(nullptr, "openat");
